@@ -1,6 +1,23 @@
 # bspm
 Experimental tool for building C++ with Modules
 
+## How to use
+
+Initialize project
+```console
+bspm init <dir>
+```
+
+Build project
+```console
+bspm build <dir>
+```
+
+Build executable
+```console
+bspm run <dir>
+```
+
 ## Dependencies
 included:
 * [nlohmann/json](https://github.com/nlohmann/json)
