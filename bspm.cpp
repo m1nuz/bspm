@@ -240,50 +240,56 @@ auto run([[maybe_unused]] application::Instance& inst, [[maybe_unused]] fs::path
 int main(int argc, char* argv[]) {
     cxxopts::Options options("bspm", "C++ build system and package manager");
 
-    options.add_options("General")("v,verbose", "Print verbose", cxxopts::value<bool>()->default_value("false"))("h,help", "Print usage");
+    options.add_options()("v,verbose", "Enable verbose output")("h,help", "Print help")(
+        "path", "Directory path", cxxopts::value<std::string>())("command", "Command to execute", cxxopts::value<std::string>());
 
-    auto result = options.parse(argc, argv);
-
-    if (argc == 1) {
-        std::cout << options.help() << std::endl;
-        exit(0);
-    }
-
-    if (result.count("help")) {
-        std::cout << options.help() << std::endl;
-        exit(0);
-    }
-
-    [[maybe_unused]] auto cmds = result.unmatched();
+    options.positional_help("<command> <path>");
+    options.parse_positional({ "command", "path" });
 
     application::Instance inst;
-    inst.verbose = result["verbose"].as<bool>();
+    fs::path directory = fs::current_path().string();
 
-    for (size_t i = 0; i < std::size(cmds); i++) {
-        std::string path = fs::current_path().string();
-        if (i + 2 < static_cast<size_t>(argc)) {
-            if (!cmds[i + 1].empty()) {
-                path = cmds[i + 1];
+    try {
+        auto result = options.parse(argc, argv);
+
+        if (result.count("help")) {
+            std::cout << options.help() << std::endl;
+            return 0;
+        }
+
+        if (result.count("verbose")) {
+            inst.verbose = true;
+        }
+
+        if (inst.verbose) {
+            std::cout << "Verbose mode: " << std::boolalpha << inst.verbose << std::endl;
+        }
+
+        if (result.count("path")) {
+            directory = result["path"].as<std::string>();
+        }
+
+        if (inst.verbose) {
+            std::cout << "Directory path: " << directory << std::endl;
+        }
+
+        if (result.count("command")) {
+            if (result["command"].as<std::string>() == "init") {
+                commands::init(inst, directory.string());
+            } else if (result["command"].as<std::string>() == "build") {
+                commands::build(inst, directory.string());
+            } else if (result["command"].as<std::string>() == "run") {
+                commands::run(inst, directory.string());
+            } else {
+                std::cout << "Unknown command." << std::endl;
             }
+        } else {
+            std::cout << "Invalid command." << std::endl;
         }
-
-        if (cmds[i] == "init") {
-            commands::init(inst, path);
-            exit(0);
-        }
-
-        if (cmds[i] == "build") {
-            commands::build(inst, path);
-            exit(0);
-        }
-
-        if (cmds[i] == "run") {
-            commands::run(inst, path);
-            exit(0);
-        }
+    } catch (const cxxopts::exceptions::exception& e) {
+        std::cerr << "Error parsing command line options: " << e.what() << std::endl;
+        return 1;
     }
-
-    Logger::error("bspm", "Unknown command");
 
     return 0;
 }
