@@ -1,8 +1,9 @@
-
-#include "cxxopts.hpp"
-#include "toml.hpp"
-
-#include "Logger.hpp"
+#include <cxxopts.hpp>
+#include <fmt/chrono.h>
+#include <fmt/color.h>
+#include <fmt/core.h>
+#include <fmt/ranges.h>
+#include <toml.hpp>
 
 #include <algorithm>
 #include <filesystem>
@@ -10,6 +11,7 @@
 #include <iomanip>
 #include <iostream>
 #include <regex>
+#include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -24,6 +26,7 @@ namespace application {
 enum class Target { Bin, Lib, Shared };
 
 struct Instance {
+    std::string name = "bspm";
     std::string compiller = "gcc";
     std::string cpp_standart = "-std=c++23";
     std::string cpp_flags = "-fmodules-ts";
@@ -70,8 +73,8 @@ std::string execute_command(const std::vector<std::string>& args) {
 
 namespace commands {
 
-auto init([[maybe_unused]] application::Instance& inst, const fs::path& path) -> void {
-    Logger::message("bspm", "Init {}", path.string());
+auto init(application::Instance& inst, const fs::path& path) -> void {
+    fmt::println("{} {} Init {}", std::chrono::system_clock::now(), inst.name, path.string());
 
     if (!fs::exists(path)) {
         fs::create_directory(path);
@@ -183,22 +186,33 @@ std::string get_file_name(const std::string& file_path) {
     return path.filename().string();
 }
 
+std::string get_module_name(const std::string& file_path) {
+    std::ifstream input(file_path);
+    std::string line;
+
+    while (std::getline(input, line)) {
+        // Assuming each module statement is in the format "export module a;"
+        if (line.find("export module") != std::string::npos) {
+            std::string module_name = line.substr(line.find("module") + 7);
+            module_name.erase(module_name.find(';'));
+            return module_name;
+        }
+    }
+
+    return "";
+}
+
 std::vector<std::string> extract_dependencies(const std::string& file_path) {
     std::vector<std::string> dependencies;
     std::ifstream input(file_path);
     std::string line;
 
     while (std::getline(input, line)) {
-        // Assuming each import statement is in the format "import c;"
+        // Assuming each import statement is in the format "import a;"
         if (line.find("import") != std::string::npos) {
             std::string dependency = line.substr(line.find("import") + 7);
             dependency.erase(dependency.find(';'));
-            std::string dependency_file = dependency + ".cppm";
-
-            // Check if the dependency file exists
-            if (fs::exists(dependency_file)) {
-                dependencies.push_back(dependency_file);
-            }
+            dependencies.push_back(dependency);
         }
     }
 
@@ -207,14 +221,20 @@ std::vector<std::string> extract_dependencies(const std::string& file_path) {
 
 std::vector<std::string> sort_files_by_dependency(const std::vector<std::string>& file_paths) {
     std::unordered_map<std::string, std::unordered_set<std::string>> dependencies;
+    std::unordered_map<std::string, std::string> module_names;
     std::unordered_set<std::string> visited;
     std::vector<std::string> sorted_files;
 
-    // Extract the dependencies from each file
+    // Extract the dependencies and module names from each file
     for (const std::string& file_path : file_paths) {
         auto deps = extract_dependencies(file_path);
+        std::string module_name = get_module_name(file_path);
         std::string file_name = get_file_name(file_path);
-        dependencies[file_name] = std::unordered_set<std::string>(deps.begin(), deps.end());
+
+        if (!module_name.empty()) {
+            module_names[file_name] = module_name;
+            dependencies[file_name] = std::unordered_set<std::string>(deps.begin(), deps.end());
+        }
     }
 
     // Perform topological sorting
@@ -222,8 +242,10 @@ std::vector<std::string> sort_files_by_dependency(const std::vector<std::string>
         visited.insert(file_name);
 
         for (const std::string& dependency : dependencies[file_name]) {
-            if (visited.find(dependency) == visited.end()) {
-                visit(dependency);
+            auto it = std::find_if(module_names.begin(), module_names.end(), [&](const auto& pair) { return pair.second == dependency; });
+
+            if (it != module_names.end() && visited.find(it->first) == visited.end()) {
+                visit(it->first);
             }
         }
 
@@ -237,26 +259,21 @@ std::vector<std::string> sort_files_by_dependency(const std::vector<std::string>
         }
     }
 
-    // Reverse the sorted files to get the correct order (less dependency first)
-    // std::reverse(sorted_files.begin(), sorted_files.end());
-
     // Prepend the file paths to the sorted file names
-    std::transform(sorted_files.begin(), sorted_files.end(), sorted_files.begin(), [&](const std::string& file_name) {
+    std::vector<std::string> sorted_file_paths;
+    for (const std::string& file_name : sorted_files) {
         auto it = std::find_if(
             file_paths.begin(), file_paths.end(), [&](const std::string& file_path) { return get_file_name(file_path) == file_name; });
 
         if (it != file_paths.end()) {
-            return *it;
+            sorted_file_paths.push_back(*it);
         }
+    }
 
-        return file_name;
-    });
-
-    return sorted_files;
+    return sorted_file_paths;
 }
-
 auto build(application::Instance& inst, fs::path path) {
-    Logger::message("bspm", "Build {} working_dir={}", path.string(), fs::current_path().string());
+    fmt::println("{} {} Build {} workingDir '{}'", std::chrono::system_clock::now(), inst.name, path.string(), fs::current_path().string());
 
     // Set working directory
     fs::path previous_path = fs::current_path();
@@ -266,7 +283,7 @@ auto build(application::Instance& inst, fs::path path) {
 
     auto search_path = previous_path / path;
     if (!fs::exists(search_path)) {
-        Logger::critical("bspm", "{} not exists!", search_path.string());
+        fmt::println("{} {} ERROR: '{}' not exists!", std::chrono::system_clock::now(), inst.name, search_path.string());
         exit(0);
     }
 
@@ -350,20 +367,8 @@ static bool is_file_executable(const std::string& filename) {
     return (status.permissions() & std::filesystem::perms::owner_exec) != std::filesystem::perms::none;
 }
 
-auto run([[maybe_unused]] application::Instance& inst, [[maybe_unused]] fs::path path) {
-    Logger::message("bspm", "Run {}", path.string());
-
-    // Set working directory
-    fs::path previous_path = fs::current_path();
-    fs::current_path(path);
-
-    auto search_path = previous_path / path;
-    if (!fs::exists(search_path)) {
-        Logger::critical("bspm", "{} not exists!", search_path.string());
-        exit(0);
-    }
-
-    std::string exec_file;
+static auto find_app_file(application::Instance& inst, const fs::path& search_path) {
+    std::string app_file;
 
     for (const auto& entry : fs::directory_iterator(search_path)) {
         if (entry.is_regular_file()) {
@@ -372,19 +377,84 @@ auto run([[maybe_unused]] application::Instance& inst, [[maybe_unused]] fs::path
                     std::cout << "Exec: " << entry.path().filename().string() << std::endl;
                 }
 
-                exec_file = entry.path().string();
+                app_file = entry.path().string();
                 break;
             }
         }
     }
 
-    auto result = sys::execute_command({ exec_file });
+    return app_file;
+}
+
+auto run(application::Instance& inst, fs::path path) {
+    fmt::println("{} {} Run {}", std::chrono::system_clock::now(), inst.name, path.string());
+
+    // Set working directory
+    fs::path previous_path = fs::current_path();
+    fs::current_path(path);
+
+    auto search_path = previous_path / path;
+    if (!fs::exists(search_path)) {
+        fmt::println("{} {} ERROR: '{}' not exists!", std::chrono::system_clock::now(), inst.name, search_path.string());
+        exit(0);
+    }
+
+    auto app_file = find_app_file(inst, search_path);
+    if (app_file.empty()) {
+        fmt::println("{} {} ERROR: app file not found in '{}'", std::chrono::system_clock::now(), inst.name, search_path.string());
+        return;
+    }
+
+    auto result = sys::execute_command({ app_file });
     if (!result.empty()) {
         std::cout << result;
     }
 
     // Restore previous working directory
     fs::current_path(previous_path);
+}
+
+auto clean(application::Instance& inst, fs::path path) {
+    fmt::println("{} {} Clean {}", std::chrono::system_clock::now(), inst.name, path.string());
+
+    // Remove packages dependency file
+    {
+        std::string fullpath { path };
+        fullpath += fs::path::preferred_separator;
+        fullpath += "packages.conf";
+
+        if (fs::exists(fullpath)) {
+            if (inst.verbose) {
+                fmt::println("Remove {}", fullpath);
+            }
+
+            fs::remove(fullpath);
+        }
+    }
+
+    // Remove manifest file
+    {
+        std::string fullpath { path };
+        fullpath += fs::path::preferred_separator;
+        fullpath += "manifest.conf";
+
+        if (fs::exists(fullpath)) {
+            if (inst.verbose) {
+                fmt::println("Remove {}", fullpath);
+            }
+
+            fs::remove(fullpath);
+        }
+    }
+
+    auto app_file = find_app_file(inst, path);
+    if (!app_file.empty() && fs::exists(app_file)) {
+        if (inst.verbose) {
+            fmt::println("Remove {}", app_file);
+        }
+
+        fs::remove(app_file);
+    }
 }
 
 } // namespace commands
@@ -398,7 +468,7 @@ int main(int argc, char* argv[]) {
     options.add_options("init")("bin", "Create a package with a binary target")("lib", "Create a package with a library target")(
         "shared", "Create a package with a  shared library target");
     options.add_options("build")("d,debug", "Build with debug information")(
-        "release", "Build optimized artifacts with the release profile");
+        "r,release", "Build optimized artifacts with the release profile");
 
     options.positional_help("<command> <path>");
     options.parse_positional({ "command", "path" });
@@ -440,11 +510,18 @@ int main(int argc, char* argv[]) {
 
                 if (result.count("release")) {
                     inst.release = true;
+                    inst.debug = false;
                 }
 
-                commands::build(inst, directory.string());
+                if (result.count("debug")) {
+                    inst.debug = true;
+                }
+
+                commands::build(inst, directory);
             } else if (result["command"].as<std::string>() == "run") {
-                commands::run(inst, directory.string());
+                commands::run(inst, directory);
+            } else if (result["command"].as<std::string>() == "clean") {
+                commands::clean(inst, directory);
             } else {
                 std::cout << "Unknown command." << std::endl;
             }

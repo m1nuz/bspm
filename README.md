@@ -7,23 +7,33 @@ Initialize project
 ```console
 bspm init <dir>
 ```
+Directory structure:
+<pre>
+├── example
+│   ├── main.cpp
+│   ├── manifest.conf
+│   └── packages.conf
+</pre>
 
 Build project
 ```console
 bspm build <dir>
 ```
 
-Build executable
+Run executable
 ```console
 bspm run <dir>
 ```
 
+Clean project and remove generated files
+```console
+bspm clean <dir>
+```
+
 ## Dependencies
-included:
+included for CMale build:
 * [nlohmann/json](https://github.com/nlohmann/json)
 * [cxxopts](https://github.com/jarro2783/cxxopts)
-
-Need install:
 * [fmt](https://github.com/fmtlib/fmt)
 
 ## How to build
@@ -34,10 +44,4 @@ mkdir build
 cd build
 cmake ..
 cmake --build . -- -j$(nproc)
-```
-
-with make
-```console
-mkdir build
-make
 ```
