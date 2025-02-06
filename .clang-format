@@ -2,7 +2,7 @@ Language: Cpp
 BasedOnStyle: WebKit
 AllowShortFunctionsOnASingleLine: None
 BreakBeforeBraces: Attach
-ColumnLimit: '140'
+ColumnLimit: '120'
 IndentWidth: '4'
 SpaceBeforeParens: ControlStatements
 Standard: Auto

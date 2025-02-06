@@ -1,142 +1,111 @@
-#include <cxxopts.hpp>
-#include <fmt/chrono.h>
-#include <fmt/color.h>
-#include <fmt/core.h>
-#include <fmt/ranges.h>
-#include <toml.hpp>
+#define _CRT_SECURE_NO_WARNINGS
 
-#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
-#include <iostream>
+#include <functional>
+#include <iterator>
+#include <print>
 #include <regex>
+#include <span>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <variant>
 #include <vector>
 
 namespace fs = std::filesystem;
 
-constexpr char DefaultMain[] = R"(int main(int, char**) {
-    return 0;
-}
-)";
-
-namespace application {
-
 enum class Target { Bin, Lib, Shared };
 
-struct Instance {
-    std::string name = "bspm";
-    std::string compiller = "gcc";
-    std::string cpp_standart = "-std=c++23";
-    std::string cpp_flags = "-fmodules-ts";
-    std::string debug_flag = "-g";
-    std::string optimization_flags = "-O2";
-    std::string debug_optimization_flags = "-Og";
-    std::string ld_flags = "-lstdc++";
-    std::vector<std::string> imports;
-    Target target = Target::Bin;
-    bool verbose = false;
-    bool debug = false;
-    bool release = false;
+constexpr char VersionTag[] = "version";
+constexpr char HelpTag[] = "help";
+constexpr char BuildTag[] = "build";
+constexpr char RunTag[] = "run";
+constexpr char CleanTag[] = "clean";
+constexpr char InitTag[] = "init";
+
+std::string_view commands[] { HelpTag, InitTag, BuildTag, RunTag, CleanTag, VersionTag };
+
+constexpr char DefaultMain[] = R"(
+import <print>;
+
+int main(int argc, char** argv) {
+    std::println("Hello, world!");
+    return 0;
+}
+
+)";
+
+struct Context {
+
+    static constexpr std::string_view version { "0.0.2" };
+    static constexpr std::string_view name { "bspm" };
+
+    using Value = std::variant<uint64_t, double, std::string_view>;
+    using Options = std::unordered_map<std::string_view, Value>;
+
+    std::string cc { "gcc" };
+    std::string cpp_c { "g++" };
+    std::string cpp_standard { "-std=c++23" };
+    std::string cpp_flags { "-fmodules-ts -MD" };
+    std::string ld_flags { "-lstdc++exp" };
+    std::string output_name;
+
+    std::vector<std::string> import_sys_headers;
+
+    Target target { Target::Bin };
+
+    bool verbose { true };
+    bool debug { true };
 };
 
-} // namespace application
-
-namespace sys {
-
-std::string execute_command(const std::vector<std::string>& args) {
-    std::string command;
+auto execute_command(Context& context, std::string_view command, std::span<const std::string> args) -> void {
+    std::string full_command { command };
     for (const auto& arg : args) {
-        command += arg + " ";
+        full_command += " " + arg;
     }
 
-    std::string result;
-    FILE* pipe = popen(command.c_str(), "r");
-    if (pipe) {
-        constexpr int buffer_size = 128;
-        char buffer[buffer_size];
-
-        while (!feof(pipe)) {
-            if (fgets(buffer, buffer_size, pipe) != nullptr) {
-                result += buffer;
-            }
-        }
-
-        pclose(pipe);
+    if (context.verbose) {
+        std::println("command: {}", full_command);
     }
 
-    return result;
+    std::system(std::data(full_command));
 }
 
-} // namespace sys
+auto help_command([[maybe_unused]] Context& context, std::string_view command) -> void {
+    if (command.empty()) {
+        for (auto cmd : commands) {
+            std::println("\t{}", cmd);
+        }
 
-namespace commands {
-
-auto init(application::Instance& inst, const fs::path& path) -> void {
-    fmt::println("{} {} Init {}", std::chrono::system_clock::now(), inst.name, path.string());
-
-    if (!fs::exists(path)) {
-        fs::create_directory(path);
+        return;
     }
 
-    // Create packages dependency file
-    {
-        std::string fullpath { path };
-        fullpath += fs::path::preferred_separator;
-        fullpath += "packages.conf";
-
-        if (!fs::exists(fullpath)) {
-            if (inst.verbose) {
-                std::cout << "Create packages.conf: " << fullpath << std::endl;
-            }
-
-            std::ofstream o { fullpath };
-        }
-    }
-
-    // Create manifest file
-    {
-        std::string fullpath { path };
-        fullpath += fs::path::preferred_separator;
-        fullpath += "manifest.conf";
-
-        if (!fs::exists(fullpath)) {
-            if (inst.verbose) {
-                std::cout << "Create manifest.conf: " << fullpath << std::endl;
-            }
-
-            std::ofstream o { fullpath };
-        }
-    }
-
-    if (inst.target == application::Target::Bin) {
-
-        std::string fullpath { path };
-        fullpath += fs::path::preferred_separator;
-        fullpath += "main.cpp";
-
-        if (!fs::exists(fullpath)) {
-            if (inst.verbose) {
-                std::cout << "Create file: " << fullpath << std::endl;
-            }
-
-            std::ofstream o { fullpath };
-            o << DefaultMain;
-        }
+    if (command == VersionTag) {
+        std::println("\tShow {} current version", context.name);
     }
 }
 
-bool is_cppm(const fs::directory_entry& entry) {
+auto version_command(Context& context) -> void {
+    std::println("{} {}", context.name, context.version);
+}
+
+inline auto is_cppm(const fs::directory_entry& entry) -> bool {
     return entry.path().extension() == ".cppm";
 }
 
-std::vector<std::string> extract_library_names_from_file(const std::string& filename) {
+std::vector<std::string> extract_library_names_from_file(std::string_view filename) {
     std::vector<std::string> library_names;
 
-    std::ifstream file(filename);
+    std::ifstream file { std::data(filename) };
     if (!file) {
-        std::cerr << "Failed to open file: " << filename << std::endl;
+        std::println("Error: failed to open file '{}'", filename);
         return library_names;
     }
 
@@ -159,7 +128,8 @@ std::vector<std::string> extract_library_names_from_file(const std::string& file
     return library_names;
 }
 
-static auto process_imports([[maybe_unused]] application::Instance& inst, const std::vector<fs::directory_entry>& entries) -> void {
+static auto process_cpp_headers_imports(Context& context, const std::vector<fs::directory_entry>& entries) -> void {
+
     std::vector<std::string> imports;
 
     for (auto& entry : entries) {
@@ -172,13 +142,7 @@ static auto process_imports([[maybe_unused]] application::Instance& inst, const 
     std::sort(std::begin(imports), std::end(imports));
     imports.erase(std::unique(std::begin(imports), std::end(imports)), std::end(imports));
 
-    if (inst.verbose) {
-        for (const auto& i : imports) {
-            std::cout << "Import: " << i << std::endl;
-        }
-    }
-
-    inst.imports = imports;
+    context.import_sys_headers = imports;
 }
 
 std::string get_file_name(const std::string& file_path) {
@@ -199,7 +163,7 @@ std::string get_module_name(const std::string& file_path) {
         }
     }
 
-    return "";
+    return {};
 }
 
 std::vector<std::string> extract_dependencies(const std::string& file_path) {
@@ -242,7 +206,8 @@ std::vector<std::string> sort_files_by_dependency(const std::vector<std::string>
         visited.insert(file_name);
 
         for (const std::string& dependency : dependencies[file_name]) {
-            auto it = std::find_if(module_names.begin(), module_names.end(), [&](const auto& pair) { return pair.second == dependency; });
+            auto it = std::find_if(
+                module_names.begin(), module_names.end(), [&](const auto& pair) { return pair.second == dependency; });
 
             if (it != module_names.end() && visited.find(it->first) == visited.end()) {
                 visit(it->first);
@@ -262,8 +227,8 @@ std::vector<std::string> sort_files_by_dependency(const std::vector<std::string>
     // Prepend the file paths to the sorted file names
     std::vector<std::string> sorted_file_paths;
     for (const std::string& file_name : sorted_files) {
-        auto it = std::find_if(
-            file_paths.begin(), file_paths.end(), [&](const std::string& file_path) { return get_file_name(file_path) == file_name; });
+        auto it = std::find_if(file_paths.begin(), file_paths.end(),
+            [&](const std::string& file_path) { return get_file_name(file_path) == file_name; });
 
         if (it != file_paths.end()) {
             sorted_file_paths.push_back(*it);
@@ -272,27 +237,29 @@ std::vector<std::string> sort_files_by_dependency(const std::vector<std::string>
 
     return sorted_file_paths;
 }
-auto build(application::Instance& inst, fs::path path) {
-    fmt::println("{} {} Build {} workingDir '{}'", std::chrono::system_clock::now(), inst.name, path.string(), fs::current_path().string());
+
+auto build_command(Context& context, fs::path dir) -> void {
+    dir = !dir.empty() ? dir : ".";
+
+    if (context.verbose) {
+        std::println("{} build '{}'", context.name, dir.string());
+        execute_command(context, context.cpp_c, std::array { std::string { "-v" } });
+    }
 
     // Set working directory
     fs::path previous_path = fs::current_path();
-    fs::current_path(path);
+    fs::current_path(dir);
+
+    auto search_path = previous_path / dir;
 
     std::vector<fs::directory_entry> entries;
 
-    auto search_path = previous_path / path;
-    if (!fs::exists(search_path)) {
-        fmt::println("{} {} ERROR: '{}' not exists!", std::chrono::system_clock::now(), inst.name, search_path.string());
-        exit(0);
-    }
-
     for (const auto& entry : fs::directory_iterator(search_path)) {
         if (entry.is_regular_file()) {
-            std::string extension = entry.path().extension().string();
+            auto extension = entry.path().extension().string();
             if (extension == ".cpp" || extension == ".cppm") {
-                if (inst.verbose) {
-                    std::cout << "File: " << entry.path().filename().string() << std::endl;
+                if (context.verbose) {
+                    std::println("entry: {}", entry.path().filename().string());
                 }
 
                 entries.push_back(entry);
@@ -301,82 +268,67 @@ auto build(application::Instance& inst, fs::path path) {
     }
 
     // Sort sources with .cppm first
-    std::sort(std::begin(entries), std::end(entries),
-        [](const fs::directory_entry& a, const fs::directory_entry& b) { return is_cppm(a) && !is_cppm(b); });
+    std::sort(
+        std::begin(entries), std::end(entries), [](const auto& a, const auto& b) { return is_cppm(a) && !is_cppm(b); });
 
-    process_imports(inst, entries);
+    process_cpp_headers_imports(context, entries);
 
     std::vector<std::string> file_entries;
     for (const auto& e : entries) {
         file_entries.push_back(e.path().string());
     }
 
-    auto oredered_files = sort_files_by_dependency(file_entries);
+    auto oredered_entries = sort_files_by_dependency(file_entries);
 
-    std::vector<std::string> cmds;
-    cmds.push_back(inst.compiller);
-    cmds.push_back(inst.cpp_standart);
-    cmds.push_back(inst.cpp_flags);
-
-    if (inst.debug) {
-        cmds.push_back(inst.debug_flag);
+    // build
+    for (const auto& header : context.import_sys_headers) {
+        execute_command(context, context.cpp_c,
+            std::array { context.cpp_standard, context.cpp_flags, std::string { "-xc++-system-header" },
+                std::string { "-c" }, header });
     }
 
-    if (inst.release) {
-        cmds.push_back(inst.debug ? inst.debug_optimization_flags : inst.optimization_flags);
-    }
-
-    for (const auto& i : inst.imports) {
-        cmds.push_back("-x c++-system-header");
-        cmds.push_back(i);
-    }
-
-    bool added = false;
-    for (const auto& f : oredered_files) {
-        fs::path entry { f };
-        if (((entry.extension().string() == ".cppm") || (entry.extension().string() == ".cppm")) && !added) {
-            cmds.push_back("-x c++");
-            added = true;
-        }
-
-        cmds.push_back(f);
-    }
-
-    if (auto it = std::find(std::begin(inst.imports), std::end(inst.imports), "cmath"); it != std::end(inst.imports)) {
-        cmds.push_back("-lm");
-    }
-
-    cmds.push_back(inst.ld_flags);
-
-    cmds.push_back("-o a.out");
-
-    if (inst.verbose) {
-        for (const auto& c : cmds) {
-            std::cout << "Command: " << c << '\n';
+    for (const auto& entry : oredered_entries) {
+        fs::path entry_path { entry };
+        auto extension = entry_path.extension().string();
+        if (extension == ".cpp") {
+            execute_command(context, context.cpp_c,
+                std::array { context.cpp_standard, context.cpp_flags, std::string { "-c" }, entry });
+        } else if (extension == ".cppm") {
+            execute_command(context, context.cc,
+                std::array {
+                    std::string { "-xc++" }, context.cpp_standard, context.cpp_flags, std::string { "-c" }, entry });
         }
     }
 
-    sys::execute_command(cmds);
+    // link
+    std::vector<std::string> link_entries;
+    for (const auto& entry : entries) {
+        auto p = entry.path();
+        link_entries.push_back(p.replace_extension(".o").string());
+    }
+
+    std::vector<std::string> link_args;
+    link_args.insert(std::end(link_args), std::cbegin(link_entries), std::cend(link_entries));
+    link_args.push_back(context.ld_flags);
+    link_args.push_back("-o");
+    link_args.push_back(context.output_name);
+    execute_command(context, context.cpp_c, link_args);
 
     // Restore previous working directory
     fs::current_path(previous_path);
 }
 
-static bool is_file_executable(const std::string& filename) {
+static bool is_file_executable(std::string_view filename) {
     std::filesystem::file_status status = std::filesystem::status(filename);
     return (status.permissions() & std::filesystem::perms::owner_exec) != std::filesystem::perms::none;
 }
 
-static auto find_app_file(application::Instance& inst, const fs::path& search_path) {
+static auto find_app_file(const fs::path& search_path) {
     std::string app_file;
 
     for (const auto& entry : fs::directory_iterator(search_path)) {
         if (entry.is_regular_file()) {
             if (is_file_executable(entry.path().string())) {
-                if (inst.verbose) {
-                    std::cout << "Exec: " << entry.path().filename().string() << std::endl;
-                }
-
                 app_file = entry.path().string();
                 break;
             }
@@ -386,152 +338,157 @@ static auto find_app_file(application::Instance& inst, const fs::path& search_pa
     return app_file;
 }
 
-auto run(application::Instance& inst, fs::path path) {
-    fmt::println("{} {} Run {}", std::chrono::system_clock::now(), inst.name, path.string());
+auto run_command(Context& context, fs::path dir) -> void {
+    dir = !dir.empty() ? dir : ".";
 
     // Set working directory
     fs::path previous_path = fs::current_path();
-    fs::current_path(path);
+    fs::current_path(dir);
 
-    auto search_path = previous_path / path;
+    auto search_path = previous_path / dir;
     if (!fs::exists(search_path)) {
-        fmt::println("{} {} ERROR: '{}' not exists!", std::chrono::system_clock::now(), inst.name, search_path.string());
-        exit(0);
-    }
-
-    auto app_file = find_app_file(inst, search_path);
-    if (app_file.empty()) {
-        fmt::println("{} {} ERROR: app file not found in '{}'", std::chrono::system_clock::now(), inst.name, search_path.string());
+        std::println("Error: '{}' not exists!", search_path.string());
         return;
     }
 
-    auto result = sys::execute_command({ app_file });
-    if (!result.empty()) {
-        std::cout << result;
+    auto app_file = find_app_file(search_path);
+    if (app_file.empty() || !fs::exists(app_file)) {
+        std::println("Error: couldn't run from '{}'", dir.string());
+        return;
     }
+
+    if (context.verbose) {
+        std::println("{} running '{}'", context.name, app_file);
+    }
+
+    std::system(std::data(app_file));
 
     // Restore previous working directory
     fs::current_path(previous_path);
 }
 
-auto clean(application::Instance& inst, fs::path path) {
-    fmt::println("{} {} Clean {}", std::chrono::system_clock::now(), inst.name, path.string());
+auto clean_command(Context& context, fs::path dir) -> void {
+    dir = !dir.empty() ? dir : ".";
 
-    // Remove packages dependency file
-    {
-        std::string fullpath { path };
-        fullpath += fs::path::preferred_separator;
-        fullpath += "packages.conf";
+    // Set working directory
+    fs::path previous_path = fs::current_path();
+    fs::current_path(dir);
 
-        if (fs::exists(fullpath)) {
-            if (inst.verbose) {
-                fmt::println("Remove {}", fullpath);
-            }
-
-            fs::remove(fullpath);
-        }
+    auto search_path = previous_path / dir;
+    if (!fs::exists(search_path)) {
+        std::println("Error: '{}' not exists!", search_path.string());
+        return;
     }
 
-    // Remove manifest file
-    {
-        std::string fullpath { path };
-        fullpath += fs::path::preferred_separator;
-        fullpath += "manifest.conf";
-
-        if (fs::exists(fullpath)) {
-            if (inst.verbose) {
-                fmt::println("Remove {}", fullpath);
-            }
-
-            fs::remove(fullpath);
-        }
-    }
-
-    auto app_file = find_app_file(inst, path);
-    if (!app_file.empty() && fs::exists(app_file)) {
-        if (inst.verbose) {
-            fmt::println("Remove {}", app_file);
-        }
-
+    auto app_file = find_app_file(search_path);
+    if (!app_file.empty()) {
         fs::remove(app_file);
+    }
+
+    for (const auto& entry : fs::directory_iterator(search_path)) {
+        if (entry.is_regular_file()) {
+            auto extension = entry.path().extension().string();
+            if (extension == ".o" || extension == ".d") {
+                if (context.verbose) {
+                    std::println("remove entry: {}", entry.path().filename().string());
+                }
+
+                fs::remove(entry.path());
+            }
+        }
+    }
+
+    fs::remove_all("gcm.cache");
+
+    // Restore previous working directory
+    fs::current_path(previous_path);
+}
+
+auto init_command(Context& context, fs::path dir) -> void {
+    if (!fs::exists(dir)) {
+        fs::create_directory(dir);
+    }
+
+    if (context.target == Target::Bin) {
+        constexpr char main_file[] = "main.cpp";
+        fs::path fullpath = dir / main_file;
+
+        if (!fs::exists(fullpath)) {
+            auto f = fopen(fullpath.string().c_str(), "w");
+            if (f) {
+                std::print(f, "{}", DefaultMain);
+                fclose(f);
+            }
+        }
+
+        if (!fs::exists(fullpath)) {
+            std::println("Error: couldn't create '{}'", fullpath.string());
+        }
     }
 }
 
-} // namespace commands
+struct InitConfiguration { };
+
+auto init_context(Context& context, const InitConfiguration&) -> void {
+#if defined(_WIN32) || defined(_WIN64)
+    context.output_name = "a.exe";
+#else
+    context.output_name = "a.out";
+#endif
+}
 
 int main(int argc, char* argv[]) {
-    cxxopts::Options options("bspm", "C++ build system and package manager");
 
-    options.add_options("General")("v,verbose", "Enable verbose output")("h,help", "Print help")(
-        "path", "Directory path", cxxopts::value<std::string>())("command", "Command to execute", cxxopts::value<std::string>());
+    if (argc < 2) {
+        std::print("{} <command> <dir> <options>", "bspm");
+        return 0;
+    }
 
-    options.add_options("init")("bin", "Create a package with a binary target")("lib", "Create a package with a library target")(
-        "shared", "Create a package with a  shared library target");
-    options.add_options("build")("d,debug", "Build with debug information")(
-        "r,release", "Build optimized artifacts with the release profile");
+    Context context;
 
-    options.positional_help("<command> <path>");
-    options.parse_positional({ "command", "path" });
+    int32_t arg_idx = 0;
+    while (arg_idx < argc) {
 
-    application::Instance inst;
-    fs::path directory = fs::current_path().string();
-
-    try {
-        auto result = options.parse(argc, argv);
-
-        if (result.count("help")) {
-            std::cout << options.help() << std::endl;
+        if (std::strncmp(argv[arg_idx], HelpTag, sizeof(HelpTag)) == 0) {
+            init_context(context, {});
+            help_command(context, arg_idx + 1 < argc ? argv[arg_idx + 1] : std::string_view {});
             return 0;
         }
 
-        if (result.count("verbose")) {
-            inst.verbose = true;
+        if (std::strncmp(argv[arg_idx], VersionTag, sizeof(VersionTag)) == 0) {
+            init_context(context, {});
+            version_command(context);
+            return 0;
         }
 
-        if (inst.verbose) {
-            std::cout << "Verbose mode: " << std::boolalpha << inst.verbose << std::endl;
+        if (std::strncmp(argv[arg_idx], BuildTag, sizeof(BuildTag)) == 0) {
+            init_context(context, {});
+            build_command(context, arg_idx + 1 < argc ? argv[arg_idx + 1] : std::string_view {});
+            return 0;
         }
 
-        if (result.count("path")) {
-            directory = result["path"].as<std::string>();
+        if (std::strncmp(argv[arg_idx], RunTag, sizeof(RunTag)) == 0) {
+            init_context(context, {});
+            run_command(context, arg_idx + 1 < argc ? argv[arg_idx + 1] : std::string_view {});
+            return 0;
         }
 
-        if (inst.verbose) {
-            std::cout << "Directory path: " << directory << std::endl;
+        if (std::strncmp(argv[arg_idx], CleanTag, sizeof(CleanTag)) == 0) {
+            init_context(context, {});
+            clean_command(context, arg_idx + 1 < argc ? argv[arg_idx + 1] : std::string_view {});
+            return 0;
         }
 
-        if (result.count("command")) {
-            if (result["command"].as<std::string>() == "init") {
-                commands::init(inst, directory);
-            } else if (result["command"].as<std::string>() == "build") {
-                if (result.count("debug")) {
-                    inst.debug = true;
-                }
-
-                if (result.count("release")) {
-                    inst.release = true;
-                    inst.debug = false;
-                }
-
-                if (result.count("debug")) {
-                    inst.debug = true;
-                }
-
-                commands::build(inst, directory);
-            } else if (result["command"].as<std::string>() == "run") {
-                commands::run(inst, directory);
-            } else if (result["command"].as<std::string>() == "clean") {
-                commands::clean(inst, directory);
-            } else {
-                std::cout << "Unknown command." << std::endl;
-            }
-        } else {
-            std::cout << "Invalid command." << std::endl;
+        if (std::strncmp(argv[arg_idx], InitTag, sizeof(InitTag)) == 0) {
+            init_context(context, {});
+            init_command(context, arg_idx + 1 < argc ? argv[arg_idx + 1] : std::string_view {});
+            return 0;
         }
-    } catch (const cxxopts::exceptions::exception& e) {
-        std::cerr << "Error parsing command line options: " << e.what() << std::endl;
-        return 1;
+
+        arg_idx++;
     }
+
+    std::println("Error: '{}' unknown command!", argv[1]);
 
     return 0;
 }

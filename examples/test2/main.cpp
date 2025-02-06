@@ -1,6 +1,6 @@
-#include <iostream>
+import <print>;
 
 int main(int argc, char* argv[]) {
-    std::cout << "Hello!" << std::endl;
+    std::println("Hello, world!");
     return 0;
 }

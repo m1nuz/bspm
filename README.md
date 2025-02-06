@@ -7,12 +7,17 @@ Initialize project
 ```console
 bspm init <dir>
 ```
+
+### Example
+
+```console
+bspm init hello
+```
+
 Directory structure:
 <pre>
-├── example
-│   ├── main.cpp
-│   ├── manifest.conf
-│   └── packages.conf
+├── hello
+│   └── main.cpp
 </pre>
 
 Build project
@@ -30,18 +35,14 @@ Clean project and remove generated files
 bspm clean <dir>
 ```
 
-## Dependencies
-included for CMale build:
-* [nlohmann/json](https://github.com/nlohmann/json)
-* [cxxopts](https://github.com/jarro2783/cxxopts)
-* [fmt](https://github.com/fmtlib/fmt)
-
 ## How to build
 
-with CMake
+with g++
 ```console
-mkdir build
-cd build
-cmake ..
-cmake --build . -- -j$(nproc)
+g++ -std=c++23 -Wpedantic -Wall -Wextra -Werror bspm.cpp -O2 -lstdc++exp -o bspm
+```
+
+with clang++
+```console
+clang++ -std=c++23 -Wpedantic -Wall -Wextra -Werror bspm.cpp -O2 -o bspm
 ```
