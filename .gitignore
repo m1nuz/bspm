@@ -37,3 +37,6 @@ build
 *.pdb
 *.exe
 *.d
+*.build
+*.dependencies
+examples/*/*.pcm

@@ -22,6 +22,7 @@
 namespace fs = std::filesystem;
 
 enum class Target { Bin, Lib, Shared };
+enum class Compiler { GCC, Clang, MSCL };
 
 constexpr char VersionTag[] = "version";
 constexpr char HelpTag[] = "help";
@@ -30,17 +31,54 @@ constexpr char RunTag[] = "run";
 constexpr char CleanTag[] = "clean";
 constexpr char InitTag[] = "init";
 
-std::string_view commands[] { HelpTag, InitTag, BuildTag, RunTag, CleanTag, VersionTag };
+constexpr char GPPCompilerTag[] = "g++";
+constexpr char GCCCompilerTag[] = "gcc";
+constexpr char ClangCompilerTag[] = "clang";
+constexpr char ClangPPCompilerTag[] = "clang++";
 
-constexpr char DefaultMain[] = R"(
-import <print>;
+std::string_view commands[] {
+    HelpTag,
+    InitTag,
+    BuildTag,
+    RunTag,
+    CleanTag,
+    VersionTag,
+};
+
+constexpr std::string_view VerboseOptTag { "-v" };
+constexpr std::string_view BinaryOptTag { "--bin" };
+constexpr std::string_view LibraryOptTag { "--lib" };
+constexpr std::string_view SharedOptTag { "--shared" };
+constexpr std::string_view CompilerOptTag { "-c" };
+
+std::array BuildOpts {
+    BinaryOptTag,
+    LibraryOptTag,
+    SharedOptTag,
+    VerboseOptTag,
+    CompilerOptTag,
+};
+
+constexpr char DefaultMain[] = R"(import <print>;
 
 int main(int argc, char** argv) {
     std::println("Hello, world!");
     return 0;
 }
-
 )";
+
+struct CompileUnit {
+    std::string file_name;
+    fs::path file_path;
+    std::unordered_set<std::string> imports;
+    std::unordered_set<std::string> modules;
+
+    auto get_dependencies() const -> std::unordered_set<std::string> {
+        std::unordered_set<std::string> all_deps = imports;
+        all_deps.insert(modules.begin(), modules.end());
+        return all_deps;
+    }
+};
 
 struct Context {
 
@@ -50,6 +88,7 @@ struct Context {
     using Value = std::variant<uint64_t, double, std::string_view>;
     using Options = std::unordered_map<std::string_view, Value>;
 
+    Compiler compiler { Compiler::GCC };
     std::string cc { "gcc" };
     std::string cpp_c { "g++" };
     std::string cpp_standard { "-std=c++23" };
@@ -58,10 +97,13 @@ struct Context {
     std::string output_name;
 
     std::vector<std::string> import_sys_headers;
+    bool process_sys_imports { true };
+
+    std::vector<CompileUnit> compile_units;
 
     Target target { Target::Bin };
 
-    bool verbose { true };
+    bool verbose { false };
     bool debug { true };
 };
 
@@ -89,6 +131,17 @@ auto help_command([[maybe_unused]] Context& context, std::string_view command) -
 
     if (command == VersionTag) {
         std::println("\tShow {} current version", context.name);
+        return;
+    }
+
+    if (command == InitTag) {
+        std::println("\t{} create <dir> and init configuration for build", context.name);
+        return;
+    }
+
+    if (command == BuildTag) {
+        std::println("\t{} will initiate build in <dir>", context.name);
+        return;
     }
 }
 
@@ -100,43 +153,72 @@ inline auto is_cppm(const fs::directory_entry& entry) -> bool {
     return entry.path().extension() == ".cppm";
 }
 
-std::vector<std::string> extract_library_names_from_file(std::string_view filename) {
+auto extract_import_names_from_file(std::string_view filename)
+    -> std::tuple<std::vector<std::string>, std::vector<std::string>> {
     std::vector<std::string> library_names;
+    std::vector<std::string> module_names;
 
     std::ifstream file { std::data(filename) };
     if (!file) {
         std::println("Error: failed to open file '{}'", filename);
-        return library_names;
+        return {};
     }
 
-    std::regex import_regex(R"(import\s+<([^<>]+)>;)");
+    std::regex import_sys_regex(R"(import\s+<([^<>]+)>;)");
+    std::regex import_module_regex(R"(import\s+([^<>]+);)");
     std::string line;
 
     while (std::getline(file, line)) {
-        std::smatch match;
-        if (std::regex_search(line, match, import_regex)) {
-            std::string library_name = match[1];
+        // match sys headers
+        {
+            std::smatch match;
+            if (std::regex_search(line, match, import_sys_regex)) {
+                std::string library_name = match[1];
 
-            auto it = std::find(std::begin(library_names), std::end(library_names), library_name);
-            if (it == std::end(library_names)) {
-                library_names.push_back(library_name);
+                // TODO: maybe don't need to check
+                auto it = std::find(std::begin(library_names), std::end(library_names), library_name);
+                if (it == std::end(library_names)) {
+                    library_names.push_back(library_name);
+                }
+            }
+        }
+
+        // match modules
+        {
+            std::smatch match;
+            if (std::regex_search(line, match, import_module_regex)) {
+                module_names.push_back(match[1]);
             }
         }
     }
 
     file.close();
-    return library_names;
+    return { library_names, module_names };
 }
 
-static auto process_cpp_headers_imports(Context& context, const std::vector<fs::directory_entry>& entries) -> void {
+static auto process_units_imports(Context& context, const std::vector<fs::directory_entry>& entries) -> void {
+    context.compile_units.reserve(std::size(entries));
 
     std::vector<std::string> imports;
 
     for (auto& entry : entries) {
-        auto library_names = extract_library_names_from_file(entry.path().string());
+        CompileUnit unit;
+
+        unit.file_path = entry.path();
+        unit.file_name = unit.file_path.filename().string();
+
+        auto [library_names, module_names] = extract_import_names_from_file(entry.path().string());
         if (!library_names.empty()) {
             imports.insert(std::end(imports), std::begin(library_names), std::end(library_names));
+
+            unit.imports.insert(std::begin(library_names), std::end(library_names));
         }
+
+        if (!module_names.empty()) {
+            unit.modules.insert(std::begin(module_names), std::end(module_names));
+        }
+
+        context.compile_units.push_back(unit);
     }
 
     std::sort(std::begin(imports), std::end(imports));
@@ -175,8 +257,11 @@ std::vector<std::string> extract_dependencies(const std::string& file_path) {
         // Assuming each import statement is in the format "import a;"
         if (line.find("import") != std::string::npos) {
             std::string dependency = line.substr(line.find("import") + 7);
-            dependency.erase(dependency.find(';'));
-            dependencies.push_back(dependency);
+            auto end_pos = dependency.find(';');
+            if (end_pos != std::string::npos) {
+                dependency.erase(end_pos);
+                dependencies.push_back(dependency);
+            }
         }
     }
 
@@ -238,13 +323,97 @@ std::vector<std::string> sort_files_by_dependency(const std::vector<std::string>
     return sorted_file_paths;
 }
 
+auto sort_units_by_dependency(Context& context) -> void {
+    std::unordered_map<std::string, std::unordered_set<std::string>> dependencies;
+    std::unordered_map<std::string, std::string> module_names;
+    std::unordered_set<std::string> visited;
+    //  std::vector<std::string> sorted_files;
+    std::vector<CompileUnit> sorted_units;
+
+    // Extract the dependencies and module names from each file
+    for (const auto& unit : context.compile_units) {
+        auto file_path = unit.file_path.string();
+        auto deps = extract_dependencies(file_path);
+        std::string module_name = get_module_name(file_path);
+        std::string file_name = get_file_name(file_path);
+
+        if (!module_name.empty()) {
+            module_names[file_name] = module_name;
+            dependencies[file_name] = std::unordered_set<std::string>(deps.begin(), deps.end());
+        }
+    }
+
+    // Perform topological sorting
+    // auto visit = [&](const auto& unit) {
+    //     auto file_name = unit.file_name;
+
+    //     visited.insert(file_name);
+
+    //     for (const auto& dependency : dependencies[file_name]) {
+    //         auto it = std::find_if(
+    //             module_names.begin(), module_names.end(), [&](const auto& pair) { return pair.second == dependency;
+    //             });
+
+    //         if (it != module_names.end() && visited.find(it->first) == visited.end()) {
+    //             visit(it->first);
+    //         }
+    //     }
+
+    //     sorted_units.push_back(unit);
+    // };
+
+    // for (const auto& unit : context.compile_units) {
+    //     auto file_name = unit.file_name;
+    //     if (visited.find(file_name) == visited.end()) {
+    //         visit(file_name);
+    //     }
+    // }
+
+    // // Perform topological sorting
+    // std::function<void(const std::string&)> visit = [&](const std::string& file_name) {
+    //     visited.insert(file_name);
+
+    //     for (const std::string& dependency : dependencies[file_name]) {
+    //         auto it = std::find_if(
+    //             module_names.begin(), module_names.end(), [&](const auto& pair) { return pair.second == dependency;
+    //             });
+
+    //         if (it != module_names.end() && visited.find(it->first) == visited.end()) {
+    //             visit(it->first);
+    //         }
+    //     }
+
+    //     sorted_files.push_back(file_name);
+    // };
+
+    // for (const std::string& file_path : file_paths) {
+    //     std::string file_name = get_file_name(file_path);
+    //     if (visited.find(file_name) == visited.end()) {
+    //         visit(file_name);
+    //     }
+    // }
+
+    // // Prepend the file paths to the sorted file names
+    // std::vector<std::string> sorted_file_paths;
+    // for (const std::string& file_name : sorted_files) {
+    //     auto it = std::find_if(file_paths.begin(), file_paths.end(),
+    //         [&](const std::string& file_path) { return get_file_name(file_path) == file_name; });
+
+    //     if (it != file_paths.end()) {
+    //         sorted_file_paths.push_back(*it);
+    //     }
+    // }
+
+    // return sorted_file_paths;
+}
+
 auto build_command(Context& context, fs::path dir) -> void {
     dir = !dir.empty() ? dir : ".";
 
-    if (context.verbose) {
-        std::println("{} build '{}'", context.name, dir.string());
-        execute_command(context, context.cpp_c, std::array { std::string { "-v" } });
-    }
+    // if (context.verbose) {
+    //     std::println("{} build '{}'", context.name, dir.string());
+    //     execute_command(context, context.cpp_c, std::array { std::string { "-v" } });
+    // }
 
     // Set working directory
     fs::path previous_path = fs::current_path();
@@ -271,32 +440,100 @@ auto build_command(Context& context, fs::path dir) -> void {
     std::sort(
         std::begin(entries), std::end(entries), [](const auto& a, const auto& b) { return is_cppm(a) && !is_cppm(b); });
 
-    process_cpp_headers_imports(context, entries);
+    process_units_imports(context, entries);
 
-    std::vector<std::string> file_entries;
-    for (const auto& e : entries) {
-        file_entries.push_back(e.path().string());
-    }
+    // std::vector<std::string> file_entries;
+    // for (const auto& e : entries) {
+    //     file_entries.push_back(e.path().string());
+    // }
 
-    auto oredered_entries = sort_files_by_dependency(file_entries);
+    // auto oredered_entries = sort_files_by_dependency(file_entries);
+    sort_units_by_dependency(context);
 
     // build
-    for (const auto& header : context.import_sys_headers) {
-        execute_command(context, context.cpp_c,
-            std::array { context.cpp_standard, context.cpp_flags, std::string { "-xc++-system-header" },
-                std::string { "-c" }, header });
+    if (context.process_sys_imports) {
+
+        if (context.compiler == Compiler::Clang) {
+            if (!fs::exists(".cache")) {
+                fs::create_directory(".cache");
+            }
+        }
+
+        for (const auto& header : context.import_sys_headers) {
+
+            if (context.compiler == Compiler::GCC) {
+                execute_command(context, context.cpp_c,
+                    std::array { context.cpp_standard, context.cpp_flags, std::string { "-xc++-system-header" },
+                        std::string { "-c" }, header });
+            } else if (context.compiler == Compiler::Clang) {
+                fs::path header_path { header };
+
+                execute_command(context, context.cpp_c,
+                    std::array { context.cpp_standard, context.cpp_flags,
+                        std::string { "-xc++-system-header --precompile" }, std::string { "-c" }, header,
+                        std::string { "-o" }, (".cache" / header_path).replace_extension(".pcm").string() });
+            }
+        }
     }
 
-    for (const auto& entry : oredered_entries) {
-        fs::path entry_path { entry };
+    for (const auto& unit : context.compile_units) {
+        fs::path entry_path = unit.file_path;
         auto extension = entry_path.extension().string();
         if (extension == ".cpp") {
-            execute_command(context, context.cpp_c,
-                std::array { context.cpp_standard, context.cpp_flags, std::string { "-c" }, entry });
+            std::vector<std::string> args;
+
+            args.push_back(context.cpp_standard);
+            args.push_back(context.cpp_flags);
+
+            if (context.compiler == Compiler::Clang) {
+                // args.push_back(std::string { "-fprebuilt-module-path=." });
+                args.push_back("-Wno-experimental-header-units");
+
+                for (const auto& imported_module : unit.imports) {
+                    std::string module_file;
+                    std::format_to(std::back_inserter(module_file), "-fmodule-file=\"{}.pcm\"",
+                        (search_path / ".cache" / imported_module).string());
+                    args.push_back(module_file);
+                }
+
+                for (const auto& imported_module : unit.modules) {
+                    std::string module_file;
+                    std::format_to(std::back_inserter(module_file), "-fmodule-file=\"{}.pcm\"",
+                        (search_path / imported_module).string());
+                    args.push_back(module_file);
+                }
+            }
+
+            args.push_back(std::string { "-c" });
+            args.push_back(unit.file_name);
+
+            execute_command(context, context.cpp_c, args);
         } else if (extension == ".cppm") {
-            execute_command(context, context.cc,
-                std::array {
-                    std::string { "-xc++" }, context.cpp_standard, context.cpp_flags, std::string { "-c" }, entry });
+            std::vector<std::string> args;
+
+            args.push_back(std::string { "-xc++" });
+            args.push_back(context.cpp_standard);
+            args.push_back(context.cpp_flags);
+
+            if (context.compiler == Compiler::Clang) {
+                args.push_back(std::string { "-xc++-module" });
+                // args.push_back(std::string { "--precompile" });
+                // args.push_back(std::string { "-fprebuilt-module-path=." });
+
+                args.push_back("-Wno-experimental-header-units");
+
+                for (const auto& imported_module : unit.imports) {
+                    std::string module_file;
+                    std::format_to(std::back_inserter(module_file), "-fmodule-file=\"{}.pcm\"",
+                        (search_path / ".cache" / imported_module).string());
+                    args.push_back(module_file);
+                }
+            }
+
+            args.push_back(std::string { "-c" });
+            args.push_back(unit.file_name);
+
+            execute_command(context, context.cpp_c, args);
         }
     }
 
@@ -398,7 +635,21 @@ auto clean_command(Context& context, fs::path dir) -> void {
         }
     }
 
-    fs::remove_all("gcm.cache");
+    if (fs::exists(search_path / "gcm.cache")) {
+        if (auto res = fs::remove_all(search_path / "gcm.cache"); res != static_cast<std::uintmax_t>(-1) || res > 1) {
+            if (context.verbose) {
+                std::println("remove entry: {}", "gcm.cache");
+            }
+        }
+    }
+
+    if (fs::exists(search_path / ".cache")) {
+        if (auto res = fs::remove_all(search_path / ".cache"); res != static_cast<std::uintmax_t>(-1) || res > 1) {
+            if (context.verbose) {
+                std::println("remove entry: {}", ".cache");
+            }
+        }
+    }
 
     // Restore previous working directory
     fs::current_path(previous_path);
@@ -409,15 +660,37 @@ auto init_command(Context& context, fs::path dir) -> void {
         fs::create_directory(dir);
     }
 
+    // Create build configuration file
+    {
+        fs::path fullpath = dir / ".build";
+        if (!fs::exists(fullpath)) {
+            std::ofstream f { fullpath };
+            if (f.good()) {
+                f.close();
+            }
+        }
+    }
+
+    // Create packages dependency file
+    {
+        fs::path fullpath = dir / ".dependencies";
+        if (!fs::exists(fullpath)) {
+            std::ofstream f { fullpath };
+            if (f.good()) {
+                f.close();
+            }
+        }
+    }
+
     if (context.target == Target::Bin) {
         constexpr char main_file[] = "main.cpp";
         fs::path fullpath = dir / main_file;
 
         if (!fs::exists(fullpath)) {
-            auto f = fopen(fullpath.string().c_str(), "w");
-            if (f) {
-                std::print(f, "{}", DefaultMain);
-                fclose(f);
+            std::ofstream f { fullpath };
+            if (f.good()) {
+                f.write(DefaultMain, sizeof(DefaultMain) - 1);
+                f.close();
             }
         }
 
@@ -427,14 +700,100 @@ auto init_command(Context& context, fs::path dir) -> void {
     }
 }
 
-struct InitConfiguration { };
+struct InitConfiguration {
+    int32_t argc { 0 };
+    int32_t index { 0 };
+    char** argv { nullptr };
+};
 
-auto init_context(Context& context, const InitConfiguration&) -> void {
+static auto check_option(std::span<const std::string_view> opts, std::string_view opt) -> bool {
+    for (auto o : opts) {
+        if (o == opt) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+auto init_gcc_compiler(Context& context) -> void {
+    context.compiler = Compiler::GCC;
+    context.cpp_c = GPPCompilerTag;
+    context.cc = GCCCompilerTag;
+    context.cpp_standard = "-std=c++23";
+    context.cpp_flags = "-fmodules-ts -MD";
+    context.ld_flags = "-lstdc++exp";
+    context.process_sys_imports = true;
+}
+
+auto init_clang_compiler(Context& context) -> void {
+    context.compiler = Compiler::Clang;
+    context.cc = "clang";
+    context.cpp_c = "clang++";
+    context.cpp_standard = "-std=c++23";
+    context.cpp_flags = "-fmodules -MD";
+    context.ld_flags.clear();
+    context.process_sys_imports = true;
+}
+
+auto init_context(Context& context, std::string_view command, const InitConfiguration& conf) -> bool {
 #if defined(_WIN32) || defined(_WIN64)
     context.output_name = "a.exe";
 #else
     context.output_name = "a.out";
 #endif
+
+    if (conf.argv && conf.index < conf.argc) {
+        int32_t idx = conf.index;
+
+        while (idx < conf.argc) {
+            if (std::strncmp(conf.argv[idx], std::data(VerboseOptTag), std::size(VerboseOptTag)) == 0) {
+                context.verbose = true;
+            }
+
+            if (command == BuildTag) {
+                if (!check_option(BuildOpts, conf.argv[idx])) {
+                    std::println("Error: Invalid option '{}' for {} command", conf.argv[idx], command);
+                    return false;
+                }
+
+                if (std::strncmp(conf.argv[idx], std::data(BinaryOptTag), std::size(BinaryOptTag)) == 0) {
+                    context.target = Target::Bin;
+                } else if (std::strncmp(conf.argv[idx], std::data(LibraryOptTag), std::size(LibraryOptTag)) == 0) {
+                    context.target = Target::Lib;
+                } else if (std::strncmp(conf.argv[idx], std::data(SharedOptTag), std::size(SharedOptTag)) == 0) {
+                    context.target = Target::Shared;
+                }
+
+                if (std::strncmp(conf.argv[idx], std::data(CompilerOptTag), std::size(CompilerOptTag)) == 0) {
+                    if (idx + 1 < conf.argc) {
+                        idx++;
+
+                        if (std::strncmp(conf.argv[idx], GPPCompilerTag, sizeof(GPPCompilerTag)) == 0
+                            || std::strncmp(conf.argv[idx], GCCCompilerTag, sizeof(GCCCompilerTag)) == 0) {
+                            init_gcc_compiler(context);
+                        } else if (std::strncmp(conf.argv[idx], ClangPPCompilerTag, sizeof(ClangPPCompilerTag)) == 0
+                            || std::strncmp(conf.argv[idx], ClangCompilerTag, sizeof(ClangCompilerTag)) == 0) {
+                            init_clang_compiler(context);
+                        } else {
+                            std::println(
+                                "Error: Unknown compiler parameter {} for {} command", conf.argv[idx], command);
+                            return false;
+                        }
+
+                    } else {
+                        std::println("Error: Invalid option '{}' for {} command, option didn't have {}", conf.argv[idx],
+                            command, "parameter");
+                        return false;
+                    }
+                }
+            }
+
+            idx++;
+        }
+    }
+
+    return true;
 }
 
 int main(int argc, char* argv[]) {
@@ -450,37 +809,40 @@ int main(int argc, char* argv[]) {
     while (arg_idx < argc) {
 
         if (std::strncmp(argv[arg_idx], HelpTag, sizeof(HelpTag)) == 0) {
-            init_context(context, {});
+            init_context(context, HelpTag, {});
             help_command(context, arg_idx + 1 < argc ? argv[arg_idx + 1] : std::string_view {});
             return 0;
         }
 
         if (std::strncmp(argv[arg_idx], VersionTag, sizeof(VersionTag)) == 0) {
-            init_context(context, {});
+            init_context(context, VersionTag, {});
             version_command(context);
             return 0;
         }
 
         if (std::strncmp(argv[arg_idx], BuildTag, sizeof(BuildTag)) == 0) {
-            init_context(context, {});
+            if (!init_context(context, BuildTag, { .argc = argc, .index = arg_idx + 2, .argv = argv })) {
+                std::println("Type '{} help {}' for more description.", context.name, BuildTag);
+                return 0;
+            }
             build_command(context, arg_idx + 1 < argc ? argv[arg_idx + 1] : std::string_view {});
             return 0;
         }
 
         if (std::strncmp(argv[arg_idx], RunTag, sizeof(RunTag)) == 0) {
-            init_context(context, {});
+            init_context(context, RunTag, { .argc = argc, .index = arg_idx + 2, .argv = argv });
             run_command(context, arg_idx + 1 < argc ? argv[arg_idx + 1] : std::string_view {});
             return 0;
         }
 
         if (std::strncmp(argv[arg_idx], CleanTag, sizeof(CleanTag)) == 0) {
-            init_context(context, {});
+            init_context(context, CleanTag, { .argc = argc, .index = arg_idx + 2, .argv = argv });
             clean_command(context, arg_idx + 1 < argc ? argv[arg_idx + 1] : std::string_view {});
             return 0;
         }
 
         if (std::strncmp(argv[arg_idx], InitTag, sizeof(InitTag)) == 0) {
-            init_context(context, {});
+            init_context(context, InitTag, {});
             init_command(context, arg_idx + 1 < argc ? argv[arg_idx + 1] : std::string_view {});
             return 0;
         }
