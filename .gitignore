@@ -39,4 +39,5 @@ build
 *.d
 *.build
 *.dependencies
-examples/*/*.pcm
+*.pcm
+*.ifc
