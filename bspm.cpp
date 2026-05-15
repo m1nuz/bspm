@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -23,6 +24,7 @@
 #include <unordered_set>
 #include <variant>
 #include <vector>
+
 
 namespace fs = std::filesystem;
 
@@ -66,6 +68,8 @@ constexpr std::string_view LongOutputOptTag { "--output" };
 constexpr std::string_view DebugOptTag { "--debug" };
 constexpr std::string_view ReleaseOptTag { "--release" };
 constexpr std::string_view DryRunOptTag { "--dry-run" };
+constexpr std::string_view DependsOptTag { "--depends" };
+constexpr std::string_view ProjectOptTag { "--project" };
 
 std::array BuildOpts {
     BinaryOptTag,
@@ -78,6 +82,11 @@ std::array BuildOpts {
     DebugOptTag,
     ReleaseOptTag,
     DryRunOptTag,
+};
+
+std::array InitOpts {
+    VerboseOptTag,
+    ProjectOptTag,
 };
 
 constexpr char DefaultMain[] = R"(import <print>;
@@ -120,7 +129,7 @@ struct ScopedCurrentPath {
 
 struct Context {
 
-    static constexpr std::string_view version { "0.0.4" };
+    static constexpr std::string_view version { "0.0.5" };
     static constexpr std::string_view name { "bspm" };
 
     using Value = std::variant<uint64_t, double, std::string_view>;
@@ -150,6 +159,21 @@ struct Context {
     bool debug { true };
     bool dry_run { false };
     bool output_name_configured { false };
+    bool project_init { false };
+};
+
+struct TargetConfig {
+    std::string name;
+    fs::path path;
+    std::vector<std::string> build_options;
+    std::vector<std::string> dependencies;
+};
+
+struct ProjectConfig {
+    std::string name;
+    std::string default_target;
+    fs::path root;
+    std::vector<TargetConfig> targets;
 };
 
 auto configure_target_paths(Context& context, const fs::path& source_dir) -> void;
@@ -297,15 +321,15 @@ auto help_command(Context& context, std::string_view command) -> void {
 
     if (command == InitTag) {
         std::println("Usage:");
-        std::println("\t{} {} <dir>", context.name, InitTag);
+        std::println("\t{} {} <dir> [--project]", context.name, InitTag);
         std::println("");
-        std::println("Create <dir>, .build, .dependencies, and a starter main.cpp.");
+        std::println("Create a simple folder target, or use --project to scaffold bspm.build and an app target.");
         return;
     }
 
     if (command == BuildTag) {
         std::println("Usage:");
-        std::println("\t{} {} [dir] [options]", context.name, BuildTag);
+        std::println("\t{} {} [dir|target|all] [options]", context.name, BuildTag);
         std::println("");
         std::println("Options:");
         std::println("\t-c <g++|clang++|msvc>\tChoose compiler");
@@ -322,7 +346,7 @@ auto help_command(Context& context, std::string_view command) -> void {
 
     if (command == RunTag) {
         std::println("Usage:");
-        std::println("\t{} {} [dir] [-v]", context.name, RunTag);
+        std::println("\t{} {} [dir|target] [-v]", context.name, RunTag);
         std::println("");
         std::println("Run the executable produced for [dir].");
         return;
@@ -330,7 +354,7 @@ auto help_command(Context& context, std::string_view command) -> void {
 
     if (command == CleanTag) {
         std::println("Usage:");
-        std::println("\t{} {} [dir] [-v]", context.name, CleanTag);
+        std::println("\t{} {} [dir|target|all] [-v]", context.name, CleanTag);
         std::println("");
         std::println("Remove generated files for [dir].");
         return;
@@ -1327,7 +1351,7 @@ static auto newest_library_in(const fs::path& root) -> fs::path {
 
 static auto find_app_file(const Context& context) -> fs::path {
     auto output_path = context.build_dir / context.output_name;
-    if (fs::is_regular_file(output_path)) {
+    if (fs::is_regular_file(output_path) && is_file_executable(output_path.string())) {
         return output_path;
     }
 
@@ -1350,6 +1374,11 @@ auto run_command(Context& context, fs::path dir) -> bool {
     }
 
     configure_target_paths(context, search_path);
+
+    if (target_is_library(context)) {
+        std::println("Error: '{}' produces a library, not a runnable executable", dir.string());
+        return false;
+    }
 
     auto app_file = find_app_file(context);
     if (app_file.empty() || !fs::exists(app_file)) {
@@ -1407,20 +1436,15 @@ auto clean_command(Context& context, fs::path dir) -> bool {
     return true;
 }
 
+auto project_name_for(const fs::path& dir) -> std::string {
+    auto normalized_dir = fs::absolute(dir).lexically_normal();
+    auto project_name = normalized_dir.filename().string();
+    return project_name.empty() ? "app" : project_name;
+}
+
 auto init_command(Context& context, fs::path dir) -> void {
     if (!fs::exists(dir)) {
-        fs::create_directory(dir);
-    }
-
-    // Create build configuration file
-    {
-        fs::path fullpath = dir / ".build";
-        if (!fs::exists(fullpath)) {
-            std::ofstream f { fullpath };
-            if (f.good()) {
-                f.close();
-            }
-        }
+        fs::create_directories(dir);
     }
 
     // Create packages dependency file
@@ -1432,6 +1456,39 @@ auto init_command(Context& context, fs::path dir) -> void {
                 f.close();
             }
         }
+    }
+
+    if (context.project_init) {
+        const auto project_name = project_name_for(dir);
+
+        fs::path config_path = dir / "bspm.build";
+        if (!fs::exists(config_path)) {
+            std::ofstream f { config_path };
+            if (f.good()) {
+                f << "project " << project_name << "\n";
+                f << "default app\n\n";
+                f << "target app app --bin -o " << project_name << "\n";
+                f.close();
+            }
+        }
+
+        fs::create_directories(dir / "app");
+        constexpr char main_file[] = "main.cpp";
+        fs::path fullpath = dir / "app" / main_file;
+
+        if (!fs::exists(fullpath)) {
+            std::ofstream f { fullpath };
+            if (f.good()) {
+                f.write(DefaultMain, sizeof(DefaultMain) - 1);
+                f.close();
+            }
+        }
+
+        if (!fs::exists(fullpath)) {
+            std::println("Error: couldn't create '{}'", fullpath.string());
+        }
+
+        return;
     }
 
     if (context.target == Target::Bin) {
@@ -1617,6 +1674,239 @@ auto is_option_argument(std::string_view argument) -> bool {
     return !argument.empty() && argument.front() == '-';
 }
 
+auto tokenize_config_line(std::string_view line, std::size_t line_number, bool& ok) -> std::vector<std::string> {
+    std::vector<std::string> tokens;
+    std::string token;
+    bool in_quotes = false;
+    bool escaped = false;
+
+    for (char ch : line) {
+        if (escaped) {
+            token.push_back(ch);
+            escaped = false;
+            continue;
+        }
+
+        if (in_quotes && ch == '\\') {
+            escaped = true;
+            continue;
+        }
+
+        if (ch == '"') {
+            in_quotes = !in_quotes;
+            continue;
+        }
+
+        if (!in_quotes && ch == '#') {
+            break;
+        }
+
+        if (!in_quotes && std::isspace(static_cast<unsigned char>(ch))) {
+            if (!token.empty()) {
+                tokens.push_back(std::move(token));
+                token.clear();
+            }
+            continue;
+        }
+
+        token.push_back(ch);
+    }
+
+    if (escaped || in_quotes) {
+        std::println("Error: invalid quoted string in bspm.build line {}", line_number);
+        ok = false;
+        return {};
+    }
+
+    if (!token.empty()) {
+        tokens.push_back(std::move(token));
+    }
+
+    return tokens;
+}
+
+auto apply_build_options(Context& context, std::span<const std::string_view> opts, std::string_view source) -> bool {
+    for (std::size_t idx = 0; idx < opts.size(); ++idx) {
+        const auto opt = opts[idx];
+
+        if (opt == VerboseOptTag) {
+            context.verbose = true;
+            continue;
+        }
+
+        if (!check_option(BuildOpts, opt)) {
+            std::println("Error: Invalid option '{}' in {}", opt, source);
+            return false;
+        }
+
+        if (opt == BinaryOptTag) {
+            context.target = Target::Bin;
+        } else if (opt == LibraryOptTag) {
+            context.target = Target::Lib;
+        } else if (opt == SharedOptTag) {
+            context.target = Target::Shared;
+        } else if (opt == DebugOptTag) {
+            context.debug = true;
+        } else if (opt == ReleaseOptTag) {
+            context.debug = false;
+        } else if (opt == DryRunOptTag) {
+            context.dry_run = true;
+        } else if (opt == CompilerOptTag) {
+            if (idx + 1 >= opts.size() || is_option_argument(opts[idx + 1])) {
+                std::println("Error: Invalid option '{}' in {}, option didn't have parameter", opt, source);
+                return false;
+            }
+
+            const auto compiler = opts[++idx];
+            if (compiler == GPPCompilerTag || compiler == GCCCompilerTag) {
+                init_gcc_compiler(context);
+            } else if (compiler == ClangPPCompilerTag || compiler == ClangCompilerTag) {
+                init_clang_compiler(context);
+            } else if (compiler == MSVCCompilerTag || compiler == CLCompilerTag || compiler == CLExeCompilerTag) {
+                init_msvc_compiler(context);
+            } else {
+                std::println("Error: Unknown compiler parameter {} in {}", compiler, source);
+                return false;
+            }
+        } else if (opt == OutputOptTag || opt == LongOutputOptTag) {
+            if (idx + 1 >= opts.size() || is_option_argument(opts[idx + 1])) {
+                std::println("Error: Invalid option '{}' in {}, option didn't have parameter", opt, source);
+                return false;
+            }
+
+            context.output_name = opts[++idx];
+            context.output_name_configured = true;
+        }
+    }
+
+    return true;
+}
+
+auto finalize_build_context(Context& context) -> void {
+    append_build_mode_flags(context);
+    append_target_compile_flags(context);
+    normalize_output_name(context);
+}
+
+auto parse_project_config(const fs::path& config_path, ProjectConfig& project) -> bool {
+    std::ifstream file { config_path };
+    if (!file) {
+        std::println("Error: failed to open '{}'", config_path.string());
+        return false;
+    }
+
+    project.root = config_path.parent_path();
+
+    std::string line;
+    std::size_t line_number = 0;
+    while (std::getline(file, line)) {
+        ++line_number;
+
+        bool ok = true;
+        auto tokens = tokenize_config_line(line, line_number, ok);
+        if (!ok) {
+            return false;
+        }
+        if (tokens.empty()) {
+            continue;
+        }
+
+        if (tokens[0] == "project") {
+            if (tokens.size() != 2) {
+                std::println("Error: bspm.build line {} expects 'project <name>'", line_number);
+                return false;
+            }
+            project.name = tokens[1];
+            continue;
+        }
+
+        if (tokens[0] == "default") {
+            if (tokens.size() != 2) {
+                std::println("Error: bspm.build line {} expects 'default <target>'", line_number);
+                return false;
+            }
+            project.default_target = tokens[1];
+            continue;
+        }
+
+        if (tokens[0] != "target") {
+            std::println("Error: unknown bspm.build directive '{}' on line {}", tokens[0], line_number);
+            return false;
+        }
+
+        if (tokens.size() < 3) {
+            std::println("Error: bspm.build line {} expects 'target <name> <path> [options]'", line_number);
+            return false;
+        }
+
+        TargetConfig target;
+        target.name = tokens[1];
+        target.path = tokens[2];
+
+        for (std::size_t idx = 3; idx < tokens.size(); ++idx) {
+            if (tokens[idx] == DependsOptTag) {
+                if (idx + 1 >= tokens.size() || is_option_argument(tokens[idx + 1])) {
+                    std::println("Error: invalid '{}' on bspm.build line {}", DependsOptTag, line_number);
+                    return false;
+                }
+                target.dependencies.push_back(tokens[++idx]);
+                continue;
+            }
+
+            target.build_options.push_back(tokens[idx]);
+        }
+
+        if (std::any_of(project.targets.begin(), project.targets.end(),
+                [&](const auto& existing) { return existing.name == target.name; })) {
+            std::println("Error: target '{}' is defined more than once", target.name);
+            return false;
+        }
+
+        Context validation_context;
+        std::vector<std::string_view> option_views;
+        option_views.reserve(target.build_options.size());
+        for (const auto& option : target.build_options) {
+            option_views.push_back(option);
+        }
+        if (!apply_build_options(validation_context, option_views, "bspm.build target options")) {
+            return false;
+        }
+
+        project.targets.push_back(std::move(target));
+    }
+
+    if (project.targets.empty()) {
+        std::println("Error: '{}' does not define any targets", config_path.string());
+        return false;
+    }
+
+    if (project.default_target.empty() && project.targets.size() == 1) {
+        project.default_target = project.targets.front().name;
+    }
+
+    if (!project.default_target.empty()) {
+        const bool default_exists = std::any_of(project.targets.begin(), project.targets.end(),
+            [&](const auto& target) { return target.name == project.default_target; });
+        if (!default_exists) {
+            std::println("Error: default target '{}' is not defined", project.default_target);
+            return false;
+        }
+    }
+
+    for (const auto& target : project.targets) {
+        for (const auto& dependency : target.dependencies) {
+            const bool dependency_exists = std::any_of(project.targets.begin(), project.targets.end(),
+                [&](const auto& candidate) { return candidate.name == dependency; });
+            if (!dependency_exists) {
+                std::println("Error: target '{}' depends on unknown target '{}'", target.name, dependency);
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 auto init_context(Context& context, std::string_view command, const InitConfiguration& conf) -> bool {
 #if defined(_WIN32) || defined(_WIN64)
     context.output_name = "a.exe";
@@ -1637,8 +1927,17 @@ auto init_context(Context& context, std::string_view command, const InitConfigur
             }
 
             if (command != BuildTag) {
-                std::println("Error: Invalid option '{}' for {} command", opt, command);
-                return false;
+                if (command != InitTag || !check_option(InitOpts, opt)) {
+                    std::println("Error: Invalid option '{}' for {} command", opt, command);
+                    return false;
+                }
+
+                if (opt == ProjectOptTag) {
+                    context.project_init = true;
+                }
+
+                idx++;
+                continue;
             }
 
             if (command == BuildTag) {
@@ -1715,12 +2014,173 @@ auto init_context(Context& context, std::string_view command, const InitConfigur
     }
 
     if (command == BuildTag) {
-        append_build_mode_flags(context);
-        append_target_compile_flags(context);
-        normalize_output_name(context);
+        finalize_build_context(context);
     }
 
     return true;
+}
+
+auto find_target(const ProjectConfig& project, std::string_view name) -> const TargetConfig* {
+    for (const auto& target : project.targets) {
+        if (target.name == name) {
+            return &target;
+        }
+    }
+
+    return nullptr;
+}
+
+auto build_option_views(const std::vector<std::string>& options) -> std::vector<std::string_view> {
+    std::vector<std::string_view> views;
+    views.reserve(options.size());
+    for (const auto& option : options) {
+        views.push_back(option);
+    }
+    return views;
+}
+
+auto create_target_context(const TargetConfig& target, std::span<const std::string_view> cli_options, Context& context)
+    -> bool {
+    auto config_options = build_option_views(target.build_options);
+    if (!apply_build_options(context, config_options, "bspm.build target options")) {
+        return false;
+    }
+    if (!apply_build_options(context, cli_options, "command line")) {
+        return false;
+    }
+
+    finalize_build_context(context);
+    return true;
+}
+
+auto collect_project_build_order(const ProjectConfig& project, std::span<const std::string_view> requested_targets,
+    std::vector<const TargetConfig*>& order) -> bool {
+    enum class VisitState { Visiting, Visited };
+    std::unordered_map<std::string, VisitState> states;
+
+    std::function<bool(const TargetConfig&)> visit = [&](const TargetConfig& target) {
+        if (auto it = states.find(target.name); it != states.end()) {
+            if (it->second == VisitState::Visiting) {
+                std::println("Error: cyclic target dependency involving '{}'", target.name);
+                return false;
+            }
+            return true;
+        }
+
+        states[target.name] = VisitState::Visiting;
+        for (const auto& dependency_name : target.dependencies) {
+            const auto* dependency = find_target(project, dependency_name);
+            if (!dependency || !visit(*dependency)) {
+                return false;
+            }
+        }
+
+        states[target.name] = VisitState::Visited;
+        order.push_back(&target);
+        return true;
+    };
+
+    for (const auto& target_name : requested_targets) {
+        const auto* target = find_target(project, target_name);
+        if (!target) {
+            std::println("Error: unknown target '{}'", target_name);
+            return false;
+        }
+        if (!visit(*target)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+auto build_project(const ProjectConfig& project, std::span<const std::string_view> requested_targets,
+    std::span<const std::string_view> cli_options) -> bool {
+    std::vector<const TargetConfig*> build_order;
+    if (!collect_project_build_order(project, requested_targets, build_order)) {
+        return false;
+    }
+
+    for (const auto* target : build_order) {
+        Context target_context;
+        if (!create_target_context(*target, cli_options, target_context)) {
+            return false;
+        }
+        if (!build_command(target_context, project.root / target->path)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+auto create_configured_target_context(const TargetConfig& target, bool verbose, Context& context) -> bool {
+    if (!create_target_context(target, {}, context)) {
+        return false;
+    }
+    context.verbose = verbose;
+    return true;
+}
+
+auto run_project_target(const ProjectConfig& project, std::string_view target_name, bool verbose) -> bool {
+    const auto* target = find_target(project, target_name);
+    if (!target) {
+        std::println("Error: unknown target '{}'", target_name);
+        return false;
+    }
+
+    Context target_context;
+    if (!create_configured_target_context(*target, verbose, target_context)) {
+        return false;
+    }
+
+    return run_command(target_context, project.root / target->path);
+}
+
+auto clean_project_targets(const ProjectConfig& project, std::span<const std::string_view> target_names, bool verbose)
+    -> bool {
+    for (const auto& target_name : target_names) {
+        const auto* target = find_target(project, target_name);
+        if (!target) {
+            std::println("Error: unknown target '{}'", target_name);
+            return false;
+        }
+
+        Context target_context;
+        if (!create_configured_target_context(*target, verbose, target_context)) {
+            return false;
+        }
+        if (!clean_command(target_context, project.root / target->path)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+auto load_project_config_if_present(ProjectConfig& project, bool& present) -> bool {
+    const auto config_path = fs::current_path() / "bspm.build";
+    std::error_code ec;
+    if (!fs::is_regular_file(config_path, ec) || fs::file_size(config_path, ec) == 0) {
+        present = false;
+        return false;
+    }
+
+    present = true;
+    return parse_project_config(config_path, project);
+}
+
+auto project_target_names(const ProjectConfig& project) -> std::vector<std::string_view> {
+    std::vector<std::string_view> names;
+    names.reserve(project.targets.size());
+    for (const auto& target : project.targets) {
+        names.push_back(target.name);
+    }
+    return names;
+}
+
+auto has_project_target(const ProjectConfig& project, std::string_view name) -> bool {
+    return find_target(project, name) != nullptr;
 }
 
 int main(int argc, char* argv[]) {
@@ -1747,12 +2207,42 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    ProjectConfig project;
+    bool project_present = false;
+    if (!load_project_config_if_present(project, project_present) && project_present) {
+        return 1;
+    }
+
     if (command == BuildTag) {
         fs::path dir;
         int32_t option_index = 2;
         if (argc > 2 && !is_option_argument(argv[2])) {
             dir = argv[2];
             option_index = 3;
+        }
+
+        std::vector<std::string_view> cli_options;
+        for (int32_t idx = option_index; idx < argc; ++idx) {
+            cli_options.push_back(argv[idx]);
+        }
+
+        const auto subject = dir.generic_string();
+        const bool use_project
+            = project_present && (dir.empty() || subject == "all" || has_project_target(project, subject));
+        if (use_project) {
+            std::vector<std::string_view> requested_targets;
+            if (subject == "all") {
+                requested_targets = project_target_names(project);
+            } else if (!dir.empty()) {
+                requested_targets.push_back(subject);
+            } else if (!project.default_target.empty()) {
+                requested_targets.push_back(project.default_target);
+            } else {
+                std::println("Error: project does not define a default target");
+                return 1;
+            }
+
+            return build_project(project, requested_targets, cli_options) ? 0 : 1;
         }
 
         if (!init_context(context, BuildTag, { .argc = argc, .index = option_index, .argv = argv })) {
@@ -1774,6 +2264,23 @@ int main(int argc, char* argv[]) {
             std::println("Type '{} help {}' for more description.", context.name, RunTag);
             return 1;
         }
+
+        const auto subject = dir.generic_string();
+        const bool use_project = project_present && (dir.empty() || has_project_target(project, subject));
+        if (use_project) {
+            std::string_view target_name;
+            if (!dir.empty()) {
+                target_name = subject;
+            } else if (!project.default_target.empty()) {
+                target_name = project.default_target;
+            } else {
+                std::println("Error: project does not define a default target");
+                return 1;
+            }
+
+            return run_project_target(project, target_name, context.verbose) ? 0 : 1;
+        }
+
         return run_command(context, dir) ? 0 : 1;
     }
 
@@ -1789,12 +2296,42 @@ int main(int argc, char* argv[]) {
             std::println("Type '{} help {}' for more description.", context.name, CleanTag);
             return 1;
         }
+
+        const auto subject = dir.generic_string();
+        const bool use_project
+            = project_present && (dir.empty() || subject == "all" || has_project_target(project, subject));
+        if (use_project) {
+            std::vector<std::string_view> target_names;
+            if (subject == "all") {
+                target_names = project_target_names(project);
+            } else if (!dir.empty()) {
+                target_names.push_back(subject);
+            } else if (!project.default_target.empty()) {
+                target_names.push_back(project.default_target);
+            } else {
+                std::println("Error: project does not define a default target");
+                return 1;
+            }
+
+            return clean_project_targets(project, target_names, context.verbose) ? 0 : 1;
+        }
+
         return clean_command(context, dir) ? 0 : 1;
     }
 
     if (command == InitTag) {
-        init_context(context, InitTag, {});
-        init_command(context, argc > 2 ? std::string_view { argv[2] } : std::string_view {});
+        fs::path dir;
+        int32_t option_index = 2;
+        if (argc > 2 && !is_option_argument(argv[2])) {
+            dir = argv[2];
+            option_index = 3;
+        }
+
+        if (!init_context(context, InitTag, { .argc = argc, .index = option_index, .argv = argv })) {
+            std::println("Type '{} help {}' for more description.", context.name, InitTag);
+            return 1;
+        }
+        init_command(context, dir);
         return 0;
     }
 

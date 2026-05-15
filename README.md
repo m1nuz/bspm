@@ -23,6 +23,19 @@ Directory structure:
 │   └── main.cpp
 </pre>
 
+Initialize a configured multi-target project
+```console
+bspm init hello --project
+```
+
+Directory structure:
+<pre>
+├── hello
+│   ├── bspm.build
+│   └── app
+│       └── main.cpp
+</pre>
+
 Build project
 ```console
 bspm build <dir>
@@ -84,6 +97,51 @@ Build current directory
 bspm build
 bspm build -v
 ```
+
+## Optional project config
+
+Configuration is optional. A folder can always be built directly without a
+config file:
+```console
+bspm build examples/test3
+```
+
+Use a non-empty `bspm.build` file only when one project contains several related
+folder targets or when you want shared target names, default targets, and build
+ordering:
+```text
+project demo
+default app
+
+target math libs/math --lib -o math
+target greeting libs/greeting --shared -o greeting
+target app app --bin -o demo --depends math --depends greeting
+```
+
+From the directory containing that `bspm.build` file:
+```console
+bspm build
+bspm build app
+bspm build all
+bspm run
+bspm run app
+bspm clean app
+bspm clean all
+```
+
+`bspm.build` uses a small shell-like syntax:
+- `project <name>` names the project.
+- `default <target>` chooses what bare `build`, `run`, and `clean` mean.
+- `target <name> <path> [options]` defines a folder target.
+- Target options currently accept the same build flags as the CLI plus repeated
+  `--depends <target>` entries.
+- `--depends` currently controls build order; it does not yet add link inputs
+  between targets.
+- `#` starts a comment, and quoted paths such as `"tools/code gen"` are allowed.
+
+`bspm init <dir>` keeps config out of the simple path. Use
+`bspm init <dir> --project` when you want a starter `bspm.build` file and a
+configured `app` target.
 
 Generated files are kept under a profile-specific build directory:
 ```text
