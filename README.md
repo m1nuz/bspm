@@ -58,6 +58,14 @@ bspm build
 bspm build -v
 ```
 
+Generated files are kept under a profile-specific build directory:
+```text
+<dir>/build/gcc-debug/
+<dir>/build/gcc-release/
+<dir>/build/clang-debug/
+<dir>/build/msvc-debug/
+```
+
 Run executable
 ```console
 bspm run <dir>
@@ -67,6 +75,8 @@ Clean project and remove generated files
 ```console
 bspm clean <dir>
 ```
+
+`clean` removes the target's `build/` directory.
 
 Show help
 ```console
