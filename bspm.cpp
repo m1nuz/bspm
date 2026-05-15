@@ -311,8 +311,8 @@ auto help_command(Context& context, std::string_view command) -> void {
         std::println("\t-c <g++|clang++|msvc>\tChoose compiler");
         std::println("\t-o, --output <name>\tSet output file name");
         std::println("\t--bin\t\t\tBuild executable target");
-        std::println("\t--lib\t\t\tBuild static library target (parsed, not linked yet)");
-        std::println("\t--shared\t\tBuild shared library target (parsed, not linked yet)");
+        std::println("\t--lib\t\t\tBuild static library target");
+        std::println("\t--shared\t\tBuild shared library target");
         std::println("\t--debug\t\t\tBuild with debug flags");
         std::println("\t--release\t\tBuild with optimization flags and NDEBUG");
         std::println("\t--dry-run\t\tPrint compile/link commands without running them");
@@ -561,6 +561,10 @@ auto object_path(const Context& context, fs::path source_path) -> fs::path {
     }
 
     return relative_path.replace_extension(context.object_extension);
+}
+
+auto target_is_library(const Context& context) -> bool {
+    return context.target == Target::Lib || context.target == Target::Shared;
 }
 
 auto clang_module_pcm_path(std::string_view module_name) -> fs::path {
@@ -947,11 +951,6 @@ auto build_command(Context& context, fs::path dir) -> bool {
         return false;
     }
 
-    if (context.target != Target::Bin) {
-        std::println("Error: --lib and --shared target builds are not implemented yet.");
-        return false;
-    }
-
     configure_target_paths(context, search_path);
 
     auto entries = collect_source_entries(context);
@@ -1194,20 +1193,48 @@ auto build_command(Context& context, fs::path dir) -> bool {
         }
     }
 
+    if (!ensure_parent_directory(fs::path { context.output_name })) {
+        return false;
+    }
+
     std::vector<std::string> link_args;
-    link_args.insert(std::end(link_args), std::cbegin(link_entries), std::cend(link_entries));
-    if (!context.ld_flags.empty()) {
-        link_args.push_back(context.ld_flags);
-    }
+    std::string link_command = context.cpp_c;
 
-    if (context.compiler == Compiler::MSVC) {
-        link_args.push_back(std::string { "/Fe" } + context.output_name);
+    if (context.target == Target::Lib) {
+        if (context.compiler == Compiler::MSVC) {
+            link_command = "lib";
+            link_args.push_back("/nologo");
+            link_args.push_back(std::string { "/OUT:" } + context.output_name);
+            link_args.insert(std::end(link_args), std::cbegin(link_entries), std::cend(link_entries));
+        } else {
+            link_command = "ar";
+            link_args.push_back("rcs");
+            link_args.push_back(context.output_name);
+            link_args.insert(std::end(link_args), std::cbegin(link_entries), std::cend(link_entries));
+        }
     } else {
-        link_args.push_back("-o");
-        link_args.push_back(context.output_name);
+        if (context.target == Target::Shared) {
+            if (context.compiler == Compiler::MSVC) {
+                link_args.push_back("/LD");
+            } else {
+                link_args.push_back("-shared");
+            }
+        }
+
+        link_args.insert(std::end(link_args), std::cbegin(link_entries), std::cend(link_entries));
+        if (!context.ld_flags.empty()) {
+            link_args.push_back(context.ld_flags);
+        }
+
+        if (context.compiler == Compiler::MSVC) {
+            link_args.push_back(std::string { "/Fe" } + context.output_name);
+        } else {
+            link_args.push_back("-o");
+            link_args.push_back(context.output_name);
+        }
     }
 
-    if (!execute_command(context, context.cpp_c, link_args)) {
+    if (!execute_command(context, link_command, link_args)) {
         return false;
     }
 
@@ -1222,6 +1249,12 @@ static bool is_file_executable(std::string_view filename) {
     std::filesystem::file_status status = std::filesystem::status(filename);
     return (status.permissions() & std::filesystem::perms::owner_exec) != std::filesystem::perms::none;
 #endif
+}
+
+static bool is_library_file(const fs::path& path) {
+    const auto extension = path.extension().string();
+    return extension == ".a" || extension == ".lib" || extension == ".so" || extension == ".dll"
+        || extension == ".dylib";
 }
 
 static auto newest_executable_in(const fs::path& root, std::string_view preferred_name = {}) -> fs::path {
@@ -1245,6 +1278,36 @@ static auto newest_executable_in(const fs::path& root, std::string_view preferre
         }
 
         if (!is_file_executable(it->path().string())) {
+            continue;
+        }
+
+        auto modified_at = it->last_write_time(entry_ec);
+        if (entry_ec) {
+            continue;
+        }
+
+        if (newest_path.empty() || modified_at > newest_time) {
+            newest_path = it->path();
+            newest_time = modified_at;
+        }
+    }
+
+    return newest_path;
+}
+
+static auto newest_library_in(const fs::path& root) -> fs::path {
+    std::error_code ec;
+    if (!fs::exists(root, ec)) {
+        return {};
+    }
+
+    fs::path newest_path;
+    fs::file_time_type newest_time {};
+
+    for (fs::recursive_directory_iterator it { root, fs::directory_options::skip_permission_denied, ec }, end;
+        !ec && it != end; it.increment(ec)) {
+        std::error_code entry_ec;
+        if (!it->is_regular_file(entry_ec) || !is_library_file(it->path())) {
             continue;
         }
 
@@ -1290,6 +1353,12 @@ auto run_command(Context& context, fs::path dir) -> bool {
 
     auto app_file = find_app_file(context);
     if (app_file.empty() || !fs::exists(app_file)) {
+        const auto library_file = newest_library_in(context.source_dir / "build");
+        if (!library_file.empty()) {
+            std::println("Error: '{}' produces a library, not a runnable executable", dir.string());
+            return false;
+        }
+
         std::println("Error: couldn't run from '{}'", dir.string());
         return false;
     }
@@ -1472,19 +1541,76 @@ auto append_build_mode_flags(Context& context) -> void {
     }
 }
 
-auto normalize_output_name(Context& context) -> void {
-#if defined(_WIN32) || defined(_WIN64)
-    if (context.target != Target::Bin || !context.output_name_configured) {
-        return;
-    }
-
-    fs::path output_path { context.output_name };
-    if (output_path.extension().empty()) {
-        context.output_name += ".exe";
+auto append_target_compile_flags(Context& context) -> void {
+#if !defined(_WIN32) && !defined(_WIN64)
+    if (context.target == Target::Shared && context.compiler != Compiler::MSVC) {
+        context.cpp_flags += " -fPIC";
     }
 #else
     (void)context;
 #endif
+}
+
+auto output_has_library_prefix(const fs::path& path) -> bool {
+    return path.filename().string().starts_with("lib");
+}
+
+auto prefix_output_filename(fs::path path, std::string_view prefix) -> fs::path {
+    auto filename = path.filename().string();
+    path.replace_filename(std::string { prefix } + filename);
+    return path;
+}
+
+auto normalize_output_name(Context& context) -> void {
+    if (!context.output_name_configured && target_is_library(context)) {
+        context.output_name = "a";
+    }
+
+    fs::path output_path { context.output_name };
+    const bool has_extension = !output_path.extension().empty();
+
+    if (context.target == Target::Bin) {
+#if defined(_WIN32) || defined(_WIN64)
+        if (!has_extension) {
+            context.output_name += ".exe";
+        }
+#endif
+        return;
+    }
+
+    if (context.target == Target::Lib) {
+        if (context.compiler == Compiler::MSVC) {
+            if (!has_extension) {
+                context.output_name += ".lib";
+            }
+            return;
+        }
+
+        if (!has_extension && !output_has_library_prefix(output_path)) {
+            output_path = prefix_output_filename(output_path, "lib");
+        }
+        if (!has_extension) {
+            output_path += ".a";
+        }
+        context.output_name = output_path.string();
+        return;
+    }
+
+    if (context.target == Target::Shared) {
+#if defined(_WIN32) || defined(_WIN64)
+        if (!has_extension) {
+            context.output_name += ".dll";
+        }
+#else
+        if (!has_extension && !output_has_library_prefix(output_path)) {
+            output_path = prefix_output_filename(output_path, "lib");
+        }
+        if (!has_extension) {
+            output_path += ".so";
+        }
+        context.output_name = output_path.string();
+#endif
+    }
 }
 
 auto is_option_argument(std::string_view argument) -> bool {
@@ -1590,6 +1716,7 @@ auto init_context(Context& context, std::string_view command, const InitConfigur
 
     if (command == BuildTag) {
         append_build_mode_flags(context);
+        append_target_compile_flags(context);
         normalize_output_name(context);
     }
 
