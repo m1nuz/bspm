@@ -1,5 +1,8 @@
 # bspm
-Experimental tool for building C++ with Modules
+Experimental single-file tool for building C++ with Modules.
+
+`bspm` is intentionally dependency-free: compile `bspm.cpp` with a C++23
+compiler and use the resulting executable.
 
 ## How to use
 
@@ -32,6 +35,29 @@ bspm build <dir> -c clang++
 bspm build <dir> -c msvc
 ```
 
+Choose output name
+```console
+bspm build <dir> -o hello
+bspm build <dir> --output hello
+```
+
+Choose build mode
+```console
+bspm build <dir> --debug
+bspm build <dir> --release
+```
+
+Print build commands without running them
+```console
+bspm build <dir> --dry-run
+```
+
+Build current directory
+```console
+bspm build
+bspm build -v
+```
+
 Run executable
 ```console
 bspm run <dir>
@@ -41,6 +67,15 @@ Clean project and remove generated files
 ```console
 bspm clean <dir>
 ```
+
+Show help
+```console
+bspm help
+bspm help build
+```
+
+`--lib` and `--shared` are accepted as planned target options, but linking
+library targets is not implemented yet.
 
 ## How to build
 

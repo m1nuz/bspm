@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <functional>
 #include <iterator>
@@ -60,6 +61,11 @@ constexpr std::string_view BinaryOptTag { "--bin" };
 constexpr std::string_view LibraryOptTag { "--lib" };
 constexpr std::string_view SharedOptTag { "--shared" };
 constexpr std::string_view CompilerOptTag { "-c" };
+constexpr std::string_view OutputOptTag { "-o" };
+constexpr std::string_view LongOutputOptTag { "--output" };
+constexpr std::string_view DebugOptTag { "--debug" };
+constexpr std::string_view ReleaseOptTag { "--release" };
+constexpr std::string_view DryRunOptTag { "--dry-run" };
 
 std::array BuildOpts {
     BinaryOptTag,
@@ -67,6 +73,11 @@ std::array BuildOpts {
     SharedOptTag,
     VerboseOptTag,
     CompilerOptTag,
+    OutputOptTag,
+    LongOutputOptTag,
+    DebugOptTag,
+    ReleaseOptTag,
+    DryRunOptTag,
 };
 
 constexpr char DefaultMain[] = R"(import <print>;
@@ -108,7 +119,7 @@ struct ScopedCurrentPath {
 
 struct Context {
 
-    static constexpr std::string_view version { "0.0.2" };
+    static constexpr std::string_view version { "0.0.3" };
     static constexpr std::string_view name { "bspm" };
 
     using Value = std::variant<uint64_t, double, std::string_view>;
@@ -134,6 +145,8 @@ struct Context {
 
     bool verbose { false };
     bool debug { true };
+    bool dry_run { false };
+    bool output_name_configured { false };
 };
 
 auto quote_arg(std::string_view arg) -> std::string {
@@ -236,6 +249,13 @@ auto execute_command(Context& context, std::string_view command, std::span<const
         std::fflush(stdout);
     }
 
+    if (context.dry_run) {
+        if (!context.verbose) {
+            std::println("command: {}", full_command);
+        }
+        return true;
+    }
+
     const int status = std::system(std::data(full_command));
     if (status != 0) {
         std::println("Error: command failed with status {}", status);
@@ -247,28 +267,71 @@ auto execute_command(Context& context, std::string_view command, std::span<const
 
 auto help_command(Context& context, std::string_view command) -> void {
     if (command.empty()) {
+        std::println("{} {}", context.name, context.version);
+        std::println("");
+        std::println("Usage:");
+        std::println("\t{} <command> [dir] [options]", context.name);
+        std::println("");
+        std::println("Commands:");
         for (auto cmd : commands) {
             std::println("\t{}", cmd);
         }
+        std::println("");
+        std::println("Type '{} help <command>' for command-specific help.", context.name);
 
         return;
     }
 
     if (command == VersionTag) {
-        std::println("\tShow {} current version", context.name);
+        std::println("Usage:");
+        std::println("\t{} {}", context.name, VersionTag);
+        std::println("");
+        std::println("Show {} current version.", context.name);
         return;
     }
 
     if (command == InitTag) {
-        std::println("\t{} create <dir> and init configuration for build", context.name);
+        std::println("Usage:");
+        std::println("\t{} {} <dir>", context.name, InitTag);
+        std::println("");
+        std::println("Create <dir>, .build, .dependencies, and a starter main.cpp.");
         return;
     }
 
     if (command == BuildTag) {
-        std::println("\t{} will initiate build in <dir>", context.name);
-        std::println("\tUse -c <g++|clang++|msvc> to choose compiler");
+        std::println("Usage:");
+        std::println("\t{} {} [dir] [options]", context.name, BuildTag);
+        std::println("");
+        std::println("Options:");
+        std::println("\t-c <g++|clang++|msvc>\tChoose compiler");
+        std::println("\t-o, --output <name>\tSet output file name");
+        std::println("\t--bin\t\t\tBuild executable target");
+        std::println("\t--lib\t\t\tBuild static library target (parsed, not linked yet)");
+        std::println("\t--shared\t\tBuild shared library target (parsed, not linked yet)");
+        std::println("\t--debug\t\t\tBuild with debug flags");
+        std::println("\t--release\t\tBuild with optimization flags and NDEBUG");
+        std::println("\t--dry-run\t\tPrint compile/link commands without running them");
+        std::println("\t-v\t\t\tPrint commands while building");
         return;
     }
+
+    if (command == RunTag) {
+        std::println("Usage:");
+        std::println("\t{} {} [dir] [-v]", context.name, RunTag);
+        std::println("");
+        std::println("Run the executable produced for [dir].");
+        return;
+    }
+
+    if (command == CleanTag) {
+        std::println("Usage:");
+        std::println("\t{} {} [dir] [-v]", context.name, CleanTag);
+        std::println("");
+        std::println("Remove generated files for [dir].");
+        return;
+    }
+
+    std::println("Error: unknown help command '{}'", command);
 }
 
 auto version_command(Context& context) -> void {
@@ -804,6 +867,11 @@ auto build_command(Context& context, fs::path dir) -> bool {
         return false;
     }
 
+    if (context.target != Target::Bin) {
+        std::println("Error: --lib and --shared target builds are not implemented yet.");
+        return false;
+    }
+
     ScopedCurrentPath current_path { search_path };
 
     std::vector<fs::directory_entry> entries;
@@ -1265,6 +1333,41 @@ auto init_msvc_compiler(Context& context) -> void {
     context.process_sys_imports = true;
 }
 
+auto append_build_mode_flags(Context& context) -> void {
+    if (context.compiler == Compiler::MSVC) {
+        if (context.debug) {
+            context.cpp_flags += " /Zi";
+        } else {
+            context.cpp_flags += " /O2 /DNDEBUG";
+        }
+    } else {
+        if (context.debug) {
+            context.cpp_flags += " -g";
+        } else {
+            context.cpp_flags += " -O2 -DNDEBUG";
+        }
+    }
+}
+
+auto normalize_output_name(Context& context) -> void {
+#if defined(_WIN32) || defined(_WIN64)
+    if (context.target != Target::Bin || !context.output_name_configured) {
+        return;
+    }
+
+    fs::path output_path { context.output_name };
+    if (output_path.extension().empty()) {
+        context.output_name += ".exe";
+    }
+#else
+    (void)context;
+#endif
+}
+
+auto is_option_argument(std::string_view argument) -> bool {
+    return !argument.empty() && argument.front() == '-';
+}
+
 auto init_context(Context& context, std::string_view command, const InitConfiguration& conf) -> bool {
 #if defined(_WIN32) || defined(_WIN64)
     context.output_name = "a.exe";
@@ -1276,47 +1379,83 @@ auto init_context(Context& context, std::string_view command, const InitConfigur
         int32_t idx = conf.index;
 
         while (idx < conf.argc) {
-            if (std::strncmp(conf.argv[idx], std::data(VerboseOptTag), std::size(VerboseOptTag)) == 0) {
+            std::string_view opt { conf.argv[idx] };
+
+            if (opt == VerboseOptTag) {
                 context.verbose = true;
+                idx++;
+                continue;
+            }
+
+            if (command != BuildTag) {
+                std::println("Error: Invalid option '{}' for {} command", opt, command);
+                return false;
             }
 
             if (command == BuildTag) {
-                if (!check_option(BuildOpts, conf.argv[idx])) {
-                    std::println("Error: Invalid option '{}' for {} command", conf.argv[idx], command);
+                if (!check_option(BuildOpts, opt)) {
+                    std::println("Error: Invalid option '{}' for {} command", opt, command);
                     return false;
                 }
 
-                if (std::strncmp(conf.argv[idx], std::data(BinaryOptTag), std::size(BinaryOptTag)) == 0) {
+                if (opt == BinaryOptTag) {
                     context.target = Target::Bin;
-                } else if (std::strncmp(conf.argv[idx], std::data(LibraryOptTag), std::size(LibraryOptTag)) == 0) {
+                } else if (opt == LibraryOptTag) {
                     context.target = Target::Lib;
-                } else if (std::strncmp(conf.argv[idx], std::data(SharedOptTag), std::size(SharedOptTag)) == 0) {
+                } else if (opt == SharedOptTag) {
                     context.target = Target::Shared;
+                } else if (opt == DebugOptTag) {
+                    context.debug = true;
+                } else if (opt == ReleaseOptTag) {
+                    context.debug = false;
+                } else if (opt == DryRunOptTag) {
+                    context.dry_run = true;
                 }
 
-                if (std::strncmp(conf.argv[idx], std::data(CompilerOptTag), std::size(CompilerOptTag)) == 0) {
+                if (opt == CompilerOptTag) {
                     if (idx + 1 < conf.argc) {
                         idx++;
+                        std::string_view compiler { conf.argv[idx] };
 
-                        if (std::strncmp(conf.argv[idx], GPPCompilerTag, sizeof(GPPCompilerTag)) == 0
-                            || std::strncmp(conf.argv[idx], GCCCompilerTag, sizeof(GCCCompilerTag)) == 0) {
+                        if (is_option_argument(compiler)) {
+                            std::println("Error: Invalid option '{}' for {} command, option didn't have {}", opt,
+                                command, "parameter");
+                            return false;
+                        }
+
+                        if (compiler == GPPCompilerTag || compiler == GCCCompilerTag) {
                             init_gcc_compiler(context);
-                        } else if (std::strncmp(conf.argv[idx], ClangPPCompilerTag, sizeof(ClangPPCompilerTag)) == 0
-                            || std::strncmp(conf.argv[idx], ClangCompilerTag, sizeof(ClangCompilerTag)) == 0) {
+                        } else if (compiler == ClangPPCompilerTag || compiler == ClangCompilerTag) {
                             init_clang_compiler(context);
-                        } else if (std::strncmp(conf.argv[idx], MSVCCompilerTag, sizeof(MSVCCompilerTag)) == 0
-                            || std::strncmp(conf.argv[idx], CLCompilerTag, sizeof(CLCompilerTag)) == 0
-                            || std::strncmp(conf.argv[idx], CLExeCompilerTag, sizeof(CLExeCompilerTag)) == 0) {
+                        } else if (compiler == MSVCCompilerTag || compiler == CLCompilerTag
+                            || compiler == CLExeCompilerTag) {
                             init_msvc_compiler(context);
                         } else {
-                            std::println(
-                                "Error: Unknown compiler parameter {} for {} command", conf.argv[idx], command);
+                            std::println("Error: Unknown compiler parameter {} for {} command", compiler, command);
                             return false;
                         }
 
                     } else {
-                        std::println("Error: Invalid option '{}' for {} command, option didn't have {}", conf.argv[idx],
-                            command, "parameter");
+                        std::println("Error: Invalid option '{}' for {} command, option didn't have {}", opt, command,
+                            "parameter");
+                        return false;
+                    }
+                } else if (opt == OutputOptTag || opt == LongOutputOptTag) {
+                    if (idx + 1 < conf.argc) {
+                        idx++;
+                        std::string_view output_name { conf.argv[idx] };
+
+                        if (is_option_argument(output_name)) {
+                            std::println("Error: Invalid option '{}' for {} command, option didn't have {}", opt,
+                                command, "parameter");
+                            return false;
+                        }
+
+                        context.output_name = output_name;
+                        context.output_name_configured = true;
+                    } else {
+                        std::println("Error: Invalid option '{}' for {} command, option didn't have {}", opt, command,
+                            "parameter");
                         return false;
                     }
                 }
@@ -1326,61 +1465,91 @@ auto init_context(Context& context, std::string_view command, const InitConfigur
         }
     }
 
+    if (command == BuildTag) {
+        append_build_mode_flags(context);
+        normalize_output_name(context);
+    }
+
     return true;
 }
 
 int main(int argc, char* argv[]) {
 
+    Context context;
+
     if (argc < 2) {
-        std::print("{} <command> <dir> <options>", "bspm");
+        init_context(context, HelpTag, {});
+        help_command(context, {});
         return 0;
     }
 
-    Context context;
+    std::string_view command { argv[1] };
 
-    int32_t arg_idx = 0;
-    while (arg_idx < argc) {
-
-        if (std::strncmp(argv[arg_idx], HelpTag, sizeof(HelpTag)) == 0) {
-            init_context(context, HelpTag, {});
-            help_command(context, arg_idx + 1 < argc ? argv[arg_idx + 1] : std::string_view {});
-            return 0;
-        }
-
-        if (std::strncmp(argv[arg_idx], VersionTag, sizeof(VersionTag)) == 0) {
-            init_context(context, VersionTag, {});
-            version_command(context);
-            return 0;
-        }
-
-        if (std::strncmp(argv[arg_idx], BuildTag, sizeof(BuildTag)) == 0) {
-            if (!init_context(context, BuildTag, { .argc = argc, .index = arg_idx + 2, .argv = argv })) {
-                std::println("Type '{} help {}' for more description.", context.name, BuildTag);
-                return 1;
-            }
-            return build_command(context, arg_idx + 1 < argc ? argv[arg_idx + 1] : std::string_view {}) ? 0 : 1;
-        }
-
-        if (std::strncmp(argv[arg_idx], RunTag, sizeof(RunTag)) == 0) {
-            init_context(context, RunTag, { .argc = argc, .index = arg_idx + 2, .argv = argv });
-            return run_command(context, arg_idx + 1 < argc ? argv[arg_idx + 1] : std::string_view {}) ? 0 : 1;
-        }
-
-        if (std::strncmp(argv[arg_idx], CleanTag, sizeof(CleanTag)) == 0) {
-            init_context(context, CleanTag, { .argc = argc, .index = arg_idx + 2, .argv = argv });
-            return clean_command(context, arg_idx + 1 < argc ? argv[arg_idx + 1] : std::string_view {}) ? 0 : 1;
-        }
-
-        if (std::strncmp(argv[arg_idx], InitTag, sizeof(InitTag)) == 0) {
-            init_context(context, InitTag, {});
-            init_command(context, arg_idx + 1 < argc ? argv[arg_idx + 1] : std::string_view {});
-            return 0;
-        }
-
-        arg_idx++;
+    if (command == HelpTag) {
+        init_context(context, HelpTag, {});
+        help_command(context, argc > 2 ? std::string_view { argv[2] } : std::string_view {});
+        return 0;
     }
 
-    std::println("Error: '{}' unknown command!", argv[1]);
+    if (command == VersionTag) {
+        init_context(context, VersionTag, {});
+        version_command(context);
+        return 0;
+    }
+
+    if (command == BuildTag) {
+        fs::path dir;
+        int32_t option_index = 2;
+        if (argc > 2 && !is_option_argument(argv[2])) {
+            dir = argv[2];
+            option_index = 3;
+        }
+
+        if (!init_context(context, BuildTag, { .argc = argc, .index = option_index, .argv = argv })) {
+            std::println("Type '{} help {}' for more description.", context.name, BuildTag);
+            return 1;
+        }
+        return build_command(context, dir) ? 0 : 1;
+    }
+
+    if (command == RunTag) {
+        fs::path dir;
+        int32_t option_index = 2;
+        if (argc > 2 && !is_option_argument(argv[2])) {
+            dir = argv[2];
+            option_index = 3;
+        }
+
+        if (!init_context(context, RunTag, { .argc = argc, .index = option_index, .argv = argv })) {
+            std::println("Type '{} help {}' for more description.", context.name, RunTag);
+            return 1;
+        }
+        return run_command(context, dir) ? 0 : 1;
+    }
+
+    if (command == CleanTag) {
+        fs::path dir;
+        int32_t option_index = 2;
+        if (argc > 2 && !is_option_argument(argv[2])) {
+            dir = argv[2];
+            option_index = 3;
+        }
+
+        if (!init_context(context, CleanTag, { .argc = argc, .index = option_index, .argv = argv })) {
+            std::println("Type '{} help {}' for more description.", context.name, CleanTag);
+            return 1;
+        }
+        return clean_command(context, dir) ? 0 : 1;
+    }
+
+    if (command == InitTag) {
+        init_context(context, InitTag, {});
+        init_command(context, argc > 2 ? std::string_view { argv[2] } : std::string_view {});
+        return 0;
+    }
+
+    std::println("Error: '{}' unknown command!", command);
+    std::println("Type '{} help' for command list.", context.name);
 
     return 1;
 }
