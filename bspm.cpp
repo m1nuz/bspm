@@ -119,7 +119,7 @@ struct ScopedCurrentPath {
 
 struct Context {
 
-    static constexpr std::string_view version { "0.0.3" };
+    static constexpr std::string_view version { "0.0.4" };
     static constexpr std::string_view name { "bspm" };
 
     using Value = std::variant<uint64_t, double, std::string_view>;
@@ -129,10 +129,12 @@ struct Context {
     std::string cc { "gcc" };
     std::string cpp_c { "g++" };
     std::string cpp_standard { "-std=c++23" };
-    std::string cpp_flags { "-fmodules-ts -MD" };
+    std::string cpp_flags { "-fmodules" };
     std::string ld_flags { "-lstdc++exp" };
     std::string object_extension { ".o" };
     std::string output_name;
+    fs::path source_dir;
+    fs::path build_dir;
     fs::path msvc_dev_cmd;
 
     std::vector<std::string> import_sys_headers;
@@ -148,6 +150,8 @@ struct Context {
     bool dry_run { false };
     bool output_name_configured { false };
 };
+
+auto configure_target_paths(Context& context, const fs::path& source_dir) -> void;
 
 auto quote_arg(std::string_view arg) -> std::string {
     const bool needs_quotes = arg.find_first_of(" \t\"") != std::string_view::npos;
@@ -343,7 +347,7 @@ inline auto is_cppm(const fs::directory_entry& entry) -> bool {
 }
 
 auto is_std_module_name(std::string_view module_name) -> bool {
-    return module_name == StdModuleName || module_name == "std.compat";
+    return module_name == StdModuleName || module_name == StdCompatModuleName;
 }
 
 auto ordered_std_module_references(const std::unordered_set<std::string>& imports) -> std::vector<std::string> {
@@ -351,8 +355,8 @@ auto ordered_std_module_references(const std::unordered_set<std::string>& import
     if (imports.contains(StdModuleName) || imports.contains(StdCompatModuleName)) {
         references.push_back(StdModuleName);
     }
-    if (imports.contains("std.compat")) {
-        references.push_back("std.compat");
+    if (imports.contains(StdCompatModuleName)) {
+        references.push_back(StdCompatModuleName);
     }
     return references;
 }
@@ -464,7 +468,7 @@ static auto process_units_imports(Context& context, const std::vector<fs::direct
         context.compile_units.push_back(unit);
     }
 
-    if (std::find(std::begin(std_module_imports), std::end(std_module_imports), "std.compat")
+    if (std::find(std::begin(std_module_imports), std::end(std_module_imports), StdCompatModuleName)
             != std::end(std_module_imports)
         && std::find(std::begin(std_module_imports), std::end(std_module_imports), StdModuleName)
             == std::end(std_module_imports)) {
@@ -472,10 +476,10 @@ static auto process_units_imports(Context& context, const std::vector<fs::direct
     }
 
     std::sort(std::begin(std_module_imports), std::end(std_module_imports), [](const auto& a, const auto& b) {
-        if (a == StdModuleName && b == "std.compat") {
+        if (a == StdModuleName && b == StdCompatModuleName) {
             return true;
         }
-        if (a == "std.compat" && b == StdModuleName) {
+        if (a == StdCompatModuleName && b == StdModuleName) {
             return false;
         }
         return a < b;
@@ -544,7 +548,7 @@ auto sort_units_by_dependency(Context& context) -> bool {
 }
 
 auto object_path(const Context& context, fs::path source_path) -> fs::path {
-    return source_path.replace_extension(context.object_extension);
+    return source_path.filename().replace_extension(context.object_extension);
 }
 
 auto clang_module_pcm_path(std::string_view module_name) -> fs::path {
@@ -769,7 +773,7 @@ auto prepare_std_module_imports(Context& context) -> bool {
                 std::string { "-fmodules-cache-path=.cache/clang-module-cache" },
             };
 
-            if (module_name == "std.compat") {
+            if (module_name == StdCompatModuleName) {
                 args.push_back(
                     std::string { "-fmodule-file=std=" } + std_module_pcm_path(StdModuleName).generic_string());
             }
@@ -799,7 +803,7 @@ auto prepare_std_module_imports(Context& context) -> bool {
                 std::string { "/interface" },
             };
 
-            if (module_name == "std.compat") {
+            if (module_name == StdCompatModuleName) {
                 args.push_back(std::string { "/reference" });
                 args.push_back(std::string { "std=" } + std_module_ifc_path(StdModuleName).string());
             }
@@ -818,12 +822,12 @@ auto prepare_std_module_imports(Context& context) -> bool {
     return true;
 }
 
-auto remove_gcc_header_unit_cache(Context& context, const fs::path& search_path) -> bool {
+auto remove_gcc_header_unit_cache(Context& context) -> bool {
     if (context.compiler != Compiler::GCC || context.import_sys_headers.empty()) {
         return true;
     }
 
-    const auto cache_path = search_path / "gcm.cache";
+    const auto cache_path = context.build_dir / "gcm.cache";
     std::error_code ec;
     if (!fs::exists(cache_path, ec)) {
         return true;
@@ -872,7 +876,7 @@ auto build_command(Context& context, fs::path dir) -> bool {
         return false;
     }
 
-    ScopedCurrentPath current_path { search_path };
+    configure_target_paths(context, search_path);
 
     std::vector<fs::directory_entry> entries;
 
@@ -904,9 +908,18 @@ auto build_command(Context& context, fs::path dir) -> bool {
         return false;
     }
 
-    if (!remove_gcc_header_unit_cache(context, search_path)) {
+    if (!remove_gcc_header_unit_cache(context)) {
         return false;
     }
+
+    std::error_code build_dir_ec;
+    fs::create_directories(context.build_dir, build_dir_ec);
+    if (build_dir_ec) {
+        std::println("Error: couldn't create '{}': {}", context.build_dir.string(), build_dir_ec.message());
+        return false;
+    }
+
+    ScopedCurrentPath current_path { context.build_dir };
 
     // build
     if (!prepare_std_module_imports(context)) {
@@ -975,14 +988,14 @@ auto build_command(Context& context, fs::path dir) -> bool {
                 append_msvc_import_args(args, context, unit);
 
                 args.push_back(std::string { "/Fo" } + object_path(context, unit.file_path).filename().string());
-                args.push_back(unit.file_name);
+                args.push_back(path_arg(unit.file_path));
             } else if (context.compiler == Compiler::Clang) {
                 args.push_back("-Wno-experimental-header-units");
 
                 for (const auto& imported_module : unit.imports) {
                     std::string module_file;
                     std::format_to(std::back_inserter(module_file), "-fmodule-file=\"{}.pcm\"",
-                        (search_path / ".cache" / imported_module).string());
+                        (fs::path { ".cache" } / imported_module).string());
                     args.push_back(module_file);
                 }
 
@@ -996,7 +1009,7 @@ auto build_command(Context& context, fs::path dir) -> bool {
 
             if (context.compiler != Compiler::MSVC) {
                 args.push_back(std::string { "-c" });
-                args.push_back(unit.file_name);
+                args.push_back(path_arg(unit.file_path));
             }
 
             if (!execute_command(context, context.cpp_c, args)) {
@@ -1023,7 +1036,7 @@ auto build_command(Context& context, fs::path dir) -> bool {
                 args.push_back(std::string { "/ifcOutput" });
                 args.push_back(msvc_module_ifc_path(unit.module_name).string());
                 args.push_back(std::string { "/Fo" } + object_path(context, unit.file_path).filename().string());
-                args.push_back(unit.file_name);
+                args.push_back(path_arg(unit.file_path));
             } else if (context.compiler == Compiler::Clang) {
                 if (unit.module_name.empty()) {
                     std::println("Error: '{}' does not declare an exported module", unit.file_name);
@@ -1038,7 +1051,7 @@ auto build_command(Context& context, fs::path dir) -> bool {
                 for (const auto& imported_module : unit.imports) {
                     std::string module_file;
                     std::format_to(std::back_inserter(module_file), "-fmodule-file=\"{}.pcm\"",
-                        (search_path / ".cache" / imported_module).string());
+                        (fs::path { ".cache" } / imported_module).string());
                     args.push_back(module_file);
                 }
 
@@ -1049,7 +1062,7 @@ auto build_command(Context& context, fs::path dir) -> bool {
 
                 append_previous_clang_module_references(args, context, unit_index);
 
-                args.push_back(unit.file_name);
+                args.push_back(path_arg(unit.file_path));
                 args.push_back(std::string { "-o" });
                 args.push_back(clang_module_pcm_path(unit.module_name).generic_string());
 
@@ -1080,7 +1093,7 @@ auto build_command(Context& context, fs::path dir) -> bool {
 
             if (context.compiler != Compiler::MSVC) {
                 args.push_back(std::string { "-c" });
-                args.push_back(unit.file_name);
+                args.push_back(path_arg(unit.file_path));
             }
 
             if (!execute_command(context, context.cpp_c, args)) {
@@ -1135,24 +1148,57 @@ static bool is_file_executable(std::string_view filename) {
 #endif
 }
 
-static auto find_app_file(const Context& context, const fs::path& search_path) {
-    auto output_path = search_path / context.output_name;
-    if (fs::is_regular_file(output_path)) {
-        return output_path.string();
+static auto newest_executable_in(const fs::path& root, std::string_view preferred_name = {}) -> fs::path {
+    std::error_code ec;
+    if (!fs::exists(root, ec)) {
+        return {};
     }
 
-    std::string app_file;
+    fs::path newest_path;
+    fs::file_time_type newest_time {};
 
-    for (const auto& entry : fs::directory_iterator(search_path)) {
-        if (entry.is_regular_file()) {
-            if (is_file_executable(entry.path().string())) {
-                app_file = entry.path().string();
-                break;
-            }
+    for (fs::recursive_directory_iterator it { root, fs::directory_options::skip_permission_denied, ec }, end;
+        !ec && it != end; it.increment(ec)) {
+        std::error_code entry_ec;
+        if (!it->is_regular_file(entry_ec)) {
+            continue;
+        }
+
+        if (!preferred_name.empty() && it->path().filename().string() != preferred_name) {
+            continue;
+        }
+
+        if (!is_file_executable(it->path().string())) {
+            continue;
+        }
+
+        auto modified_at = it->last_write_time(entry_ec);
+        if (entry_ec) {
+            continue;
+        }
+
+        if (newest_path.empty() || modified_at > newest_time) {
+            newest_path = it->path();
+            newest_time = modified_at;
         }
     }
 
-    return app_file;
+    return newest_path;
+}
+
+static auto find_app_file(const Context& context) -> fs::path {
+    auto output_path = context.build_dir / context.output_name;
+    if (fs::is_regular_file(output_path)) {
+        return output_path;
+    }
+
+    const auto build_root = context.source_dir / "build";
+    auto matching_output = newest_executable_in(build_root, context.output_name);
+    if (!matching_output.empty()) {
+        return matching_output;
+    }
+
+    return newest_executable_in(build_root);
 }
 
 auto run_command(Context& context, fs::path dir) -> bool {
@@ -1164,20 +1210,21 @@ auto run_command(Context& context, fs::path dir) -> bool {
         return false;
     }
 
-    ScopedCurrentPath current_path { search_path };
+    configure_target_paths(context, search_path);
 
-    auto app_file = find_app_file(context, search_path);
+    auto app_file = find_app_file(context);
     if (app_file.empty() || !fs::exists(app_file)) {
         std::println("Error: couldn't run from '{}'", dir.string());
         return false;
     }
 
     if (context.verbose) {
-        std::println("{} running '{}'", context.name, app_file);
+        std::println("{} running '{}'", context.name, app_file.string());
         std::fflush(stdout);
     }
 
-    return std::system(std::data(app_file)) == 0;
+    auto app_command = path_arg(app_file);
+    return std::system(std::data(app_command)) == 0;
 }
 
 auto clean_command(Context& context, fs::path dir) -> bool {
@@ -1189,49 +1236,26 @@ auto clean_command(Context& context, fs::path dir) -> bool {
         return false;
     }
 
-    ScopedCurrentPath current_path { search_path };
+    configure_target_paths(context, search_path);
 
-    auto app_file = find_app_file(context, search_path);
-    if (!app_file.empty()) {
-        std::error_code ec;
-        fs::remove(app_file, ec);
+    const auto build_root = context.source_dir / "build";
+    const auto normalized_source = fs::absolute(context.source_dir).lexically_normal();
+    const auto normalized_build_root = fs::absolute(build_root).lexically_normal();
+    if (normalized_build_root.parent_path() != normalized_source || normalized_build_root.filename() != "build") {
+        std::println("Error: refusing to remove unexpected build directory '{}'", normalized_build_root.string());
+        return false;
+    }
+
+    std::error_code ec;
+    if (fs::exists(normalized_build_root, ec)) {
+        fs::remove_all(normalized_build_root, ec);
         if (ec) {
-            std::println("Error: couldn't remove '{}': {}", app_file, ec.message());
+            std::println("Error: couldn't remove '{}': {}", normalized_build_root.string(), ec.message());
             return false;
         }
-    }
 
-    for (const auto& entry : fs::directory_iterator(search_path)) {
-        if (entry.is_regular_file()) {
-            auto extension = entry.path().extension().string();
-            if (extension == ".o" || extension == ".d" || extension == ".obj" || extension == ".ifc") {
-                if (context.verbose) {
-                    std::println("remove entry: {}", entry.path().filename().string());
-                }
-
-                std::error_code ec;
-                fs::remove(entry.path(), ec);
-                if (ec) {
-                    std::println("Error: couldn't remove '{}': {}", entry.path().string(), ec.message());
-                    return false;
-                }
-            }
-        }
-    }
-
-    for (const auto& cache_dir : { fs::path { "gcm.cache" }, fs::path { ".cache" } }) {
-        const auto cache_path = search_path / cache_dir;
-        std::error_code ec;
-        if (fs::exists(cache_path, ec)) {
-            fs::remove_all(cache_path, ec);
-            if (ec) {
-                std::println("Error: couldn't remove '{}': {}", cache_path.string(), ec.message());
-                return false;
-            }
-
-            if (context.verbose) {
-                std::println("remove entry: {}", cache_dir.string());
-            }
+        if (context.verbose) {
+            std::println("remove entry: {}", normalized_build_root.string());
         }
     }
 
@@ -1331,6 +1355,29 @@ auto init_msvc_compiler(Context& context) -> void {
     context.object_extension = ".obj";
     context.msvc_dev_cmd = find_vs_dev_cmd();
     context.process_sys_imports = true;
+}
+
+auto compiler_build_name(const Context& context) -> std::string_view {
+    switch (context.compiler) {
+    case Compiler::GCC:
+        return "gcc";
+    case Compiler::Clang:
+        return "clang";
+    case Compiler::MSVC:
+        return "msvc";
+    }
+
+    return "unknown";
+}
+
+auto build_mode_name(const Context& context) -> std::string_view {
+    return context.debug ? "debug" : "release";
+}
+
+auto configure_target_paths(Context& context, const fs::path& source_dir) -> void {
+    context.source_dir = fs::absolute(source_dir);
+    context.build_dir = context.source_dir / "build"
+        / (std::string { compiler_build_name(context) } + "-" + std::string { build_mode_name(context) });
 }
 
 auto append_build_mode_flags(Context& context) -> void {
