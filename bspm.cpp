@@ -91,6 +91,7 @@ int main(int argc, char** argv) {
 struct CompileUnit {
     std::string file_name;
     fs::path file_path;
+    fs::path relative_path;
     std::unordered_set<std::string> imports;
     std::unordered_set<std::string> std_module_imports;
     std::unordered_set<std::string> module_imports;
@@ -440,7 +441,12 @@ static auto process_units_imports(Context& context, const std::vector<fs::direct
         CompileUnit unit;
 
         unit.file_path = entry.path();
-        unit.file_name = unit.file_path.filename().string();
+        std::error_code ec;
+        unit.relative_path = fs::relative(unit.file_path, context.source_dir, ec);
+        if (ec) {
+            unit.relative_path = unit.file_path.filename();
+        }
+        unit.file_name = unit.relative_path.generic_string();
 
         auto [library_names, std_module_names, module_names] = extract_import_names_from_file(entry.path().string());
         unit.module_name = extract_module_name_from_file(entry.path().string());
@@ -548,7 +554,13 @@ auto sort_units_by_dependency(Context& context) -> bool {
 }
 
 auto object_path(const Context& context, fs::path source_path) -> fs::path {
-    return source_path.filename().replace_extension(context.object_extension);
+    std::error_code ec;
+    auto relative_path = fs::relative(source_path, context.source_dir, ec);
+    if (ec) {
+        relative_path = source_path.filename();
+    }
+
+    return relative_path.replace_extension(context.object_extension);
 }
 
 auto clang_module_pcm_path(std::string_view module_name) -> fs::path {
@@ -857,6 +869,70 @@ auto remove_gcc_header_unit_cache(Context& context) -> bool {
     return true;
 }
 
+auto is_ignored_source_directory(const fs::path& path) -> bool {
+    const auto name = path.filename().string();
+    if (name.empty()) {
+        return false;
+    }
+
+    return name == "build" || name == "gcm.cache" || name == ".cache" || name == ".git" || name.front() == '.';
+}
+
+auto collect_source_entries(const Context& context) -> std::vector<fs::directory_entry> {
+    std::vector<fs::directory_entry> entries;
+    std::error_code ec;
+
+    for (fs::recursive_directory_iterator it { context.source_dir, fs::directory_options::skip_permission_denied, ec },
+        end;
+        !ec && it != end; it.increment(ec)) {
+        if (it->is_directory(ec)) {
+            if (is_ignored_source_directory(it->path())) {
+                it.disable_recursion_pending();
+            }
+            continue;
+        }
+
+        if (!it->is_regular_file(ec)) {
+            continue;
+        }
+
+        const auto extension = it->path().extension().string();
+        if (extension != ".cpp" && extension != ".cppm") {
+            continue;
+        }
+
+        if (context.verbose) {
+            std::error_code relative_ec;
+            auto relative_path = fs::relative(it->path(), context.source_dir, relative_ec);
+            std::println("entry: {}", relative_ec ? it->path().filename().string() : relative_path.generic_string());
+        }
+
+        entries.push_back(*it);
+    }
+
+    if (ec) {
+        std::println("Error: couldn't inspect '{}': {}", context.source_dir.string(), ec.message());
+        return {};
+    }
+
+    return entries;
+}
+
+auto ensure_parent_directory(const fs::path& path) -> bool {
+    if (path.parent_path().empty()) {
+        return true;
+    }
+
+    std::error_code ec;
+    fs::create_directories(path.parent_path(), ec);
+    if (ec) {
+        std::println("Error: couldn't create '{}': {}", path.parent_path().string(), ec.message());
+        return false;
+    }
+
+    return true;
+}
+
 auto build_command(Context& context, fs::path dir) -> bool {
     dir = !dir.empty() ? dir : ".";
 
@@ -878,28 +954,19 @@ auto build_command(Context& context, fs::path dir) -> bool {
 
     configure_target_paths(context, search_path);
 
-    std::vector<fs::directory_entry> entries;
-
-    for (const auto& entry : fs::directory_iterator(search_path)) {
-        if (entry.is_regular_file()) {
-            auto extension = entry.path().extension().string();
-            if (extension == ".cpp" || extension == ".cppm") {
-                if (context.verbose) {
-                    std::println("entry: {}", entry.path().filename().string());
-                }
-
-                entries.push_back(entry);
-            }
-        }
-    }
+    auto entries = collect_source_entries(context);
 
     // Sort sources with .cppm first, then keep the initial order deterministic.
-    std::sort(std::begin(entries), std::end(entries), [](const auto& a, const auto& b) {
+    std::sort(std::begin(entries), std::end(entries), [&context](const auto& a, const auto& b) {
         if (is_cppm(a) != is_cppm(b)) {
             return is_cppm(a);
         }
 
-        return a.path().filename().string() < b.path().filename().string();
+        std::error_code a_ec;
+        std::error_code b_ec;
+        auto a_path = fs::relative(a.path(), context.source_dir, a_ec);
+        auto b_path = fs::relative(b.path(), context.source_dir, b_ec);
+        return (a_ec ? a.path() : a_path).generic_string() < (b_ec ? b.path() : b_path).generic_string();
     });
 
     process_units_imports(context, entries);
@@ -974,6 +1041,11 @@ auto build_command(Context& context, fs::path dir) -> bool {
     for (std::size_t unit_index = 0; unit_index < context.compile_units.size(); ++unit_index) {
         const auto& unit = context.compile_units[unit_index];
         fs::path entry_path = unit.file_path;
+        auto unit_object_path = object_path(context, unit.file_path);
+        if (!ensure_parent_directory(unit_object_path)) {
+            return false;
+        }
+
         auto extension = entry_path.extension().string();
         if (extension == ".cpp") {
             std::vector<std::string> args;
@@ -987,7 +1059,7 @@ auto build_command(Context& context, fs::path dir) -> bool {
 
                 append_msvc_import_args(args, context, unit);
 
-                args.push_back(std::string { "/Fo" } + object_path(context, unit.file_path).filename().string());
+                args.push_back(std::string { "/Fo" } + unit_object_path.string());
                 args.push_back(path_arg(unit.file_path));
             } else if (context.compiler == Compiler::Clang) {
                 args.push_back("-Wno-experimental-header-units");
@@ -1010,6 +1082,8 @@ auto build_command(Context& context, fs::path dir) -> bool {
             if (context.compiler != Compiler::MSVC) {
                 args.push_back(std::string { "-c" });
                 args.push_back(path_arg(unit.file_path));
+                args.push_back(std::string { "-o" });
+                args.push_back(path_arg(unit_object_path));
             }
 
             if (!execute_command(context, context.cpp_c, args)) {
@@ -1035,7 +1109,7 @@ auto build_command(Context& context, fs::path dir) -> bool {
 
                 args.push_back(std::string { "/ifcOutput" });
                 args.push_back(msvc_module_ifc_path(unit.module_name).string());
-                args.push_back(std::string { "/Fo" } + object_path(context, unit.file_path).filename().string());
+                args.push_back(std::string { "/Fo" } + unit_object_path.string());
                 args.push_back(path_arg(unit.file_path));
             } else if (context.compiler == Compiler::Clang) {
                 if (unit.module_name.empty()) {
@@ -1080,7 +1154,7 @@ auto build_command(Context& context, fs::path dir) -> bool {
                 object_args.push_back(std::string { "-c" });
                 object_args.push_back(clang_module_pcm_path(unit.module_name).generic_string());
                 object_args.push_back(std::string { "-o" });
-                object_args.push_back(object_path(context, unit.file_path).filename().string());
+                object_args.push_back(path_arg(unit_object_path));
 
                 if (!execute_command(context, context.cpp_c, object_args)) {
                     return false;
@@ -1094,6 +1168,8 @@ auto build_command(Context& context, fs::path dir) -> bool {
             if (context.compiler != Compiler::MSVC) {
                 args.push_back(std::string { "-c" });
                 args.push_back(path_arg(unit.file_path));
+                args.push_back(std::string { "-o" });
+                args.push_back(path_arg(unit_object_path));
             }
 
             if (!execute_command(context, context.cpp_c, args)) {
