@@ -54,6 +54,20 @@ bspm build <dir> -o hello
 bspm build <dir> --output hello
 ```
 
+Choose target type
+```console
+bspm build <dir> --bin
+bspm build <dir> --lib
+bspm build <dir> --shared
+```
+
+When `-o` omits an extension, `bspm` chooses a target-appropriate name:
+```text
+--bin    hello.exe on Windows, hello on Unix-like systems
+--lib    libhello.a for GCC/Clang, hello.lib for MSVC
+--shared hello.dll on Windows, libhello.so on Unix-like systems
+```
+
 Choose build mode
 ```console
 bspm build <dir> --debug
@@ -97,8 +111,7 @@ bspm help
 bspm help build
 ```
 
-`--lib` and `--shared` are accepted as planned target options, but linking
-library targets is not implemented yet.
+See `examples/README.md` for a tour of the included example targets.
 
 ## How to build
 
