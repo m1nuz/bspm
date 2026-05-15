@@ -28,6 +28,19 @@ Build project
 bspm build <dir>
 ```
 
+`bspm` scans the target directory recursively for `.cpp` and `.cppm` files, so
+targets may use nested source folders:
+```text
+<dir>/
+├── src/
+│   └── main.cpp
+└── modules/
+    └── hello.cppm
+```
+
+Generated directories such as `build/`, `.cache/`, and `gcm.cache/` are skipped
+during source discovery.
+
 Choose compiler
 ```console
 bspm build <dir> -c g++
