@@ -10,6 +10,7 @@ Each example is a small target that demonstrates one `bspm` capability.
 | `test4` | Standard-library module import with `import std;` | `bspm build examples/test4` | `bspm run examples/test4` |
 | `test5` | Static library target | `bspm build examples/test5 --lib -o math` | Not runnable |
 | `test6` | Shared library target | `bspm build examples/test6 --shared -o greeting` | Not runnable |
+| `test7` | Optional `bspm.build` project config with multiple named targets and dependency ordering | `cd examples/test7 && bspm build` | `cd examples/test7 && bspm run` |
 
 ## Notes
 
@@ -25,4 +26,7 @@ Each example is a small target that demonstrates one `bspm` capability.
 - `test4` may need compiler-specific standard-library module support to be available.
 - `test5` produces `libmath.a` with GCC/Clang or `math.lib` with MSVC.
 - `test6` produces `greeting.dll` on Windows or `libgreeting.so` on Unix-like systems.
+- `test7` defines `math`, `greeting`, and `app` targets in `bspm.build`; bare `build`
+  builds the default `app` target after its dependencies, while `build all`
+  builds every configured target.
 - Generated files are written under each target's `build/` directory.

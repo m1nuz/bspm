@@ -1,0 +1,6 @@
+project test7
+default app
+
+target math libs/math --lib -o math
+target greeting libs/greeting --shared -o greeting
+target app app --bin -o demo --depends math --depends greeting

@@ -37,7 +37,6 @@ build
 *.pdb
 *.exe
 *.d
-*.build
 *.dependencies
 *.pcm
 *.ifc
