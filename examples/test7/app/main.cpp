@@ -1,7 +1,8 @@
 import greeting;
 import math;
-import <print>;
+
+#include <cstdio>
 
 int main() {
-    std::println("{}: 20 + 22 = {}", greeting::message(), math::add(20, 22));
+    std::printf("%s: 20 + 22 = %d\n", greeting::message(), math::add(20, 22));
 }

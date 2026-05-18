@@ -54,6 +54,18 @@ targets may use nested source folders:
 Generated directories such as `build/`, `.cache/`, and `gcm.cache/` are skipped
 during source discovery.
 
+Named module targets may use primary interfaces, implementation units, exported
+partitions, internal partitions, and local partition imports:
+```cpp
+export module math;
+export import :ops;
+
+export module math:ops;
+module math:detail;
+module math;
+import :detail;
+```
+
 Choose compiler
 ```console
 bspm build <dir> -c g++
@@ -129,14 +141,20 @@ bspm clean app
 bspm clean all
 ```
 
+From outside the project directory, use `--project` to treat a directory as a
+project root instead of as one plain folder target:
+```console
+bspm build examples/test7 --project
+```
+
 `bspm.build` uses a small shell-like syntax:
 - `project <name>` names the project.
 - `default <target>` chooses what bare `build`, `run`, and `clean` mean.
 - `target <name> <path> [options]` defines a folder target.
 - Target options currently accept the same build flags as the CLI plus repeated
   `--depends <target>` entries.
-- `--depends` currently controls build order; it does not yet add link inputs
-  between targets.
+- `--depends` builds dependencies first, exposes their module artifacts to the
+  consumer target, and adds library outputs to the consumer link step.
 - `#` starts a comment, and quoted paths such as `"tools/code gen"` are allowed.
 
 `bspm init <dir>` keeps config out of the simple path. Use
