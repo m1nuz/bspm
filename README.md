@@ -1,4 +1,7 @@
 # bspm
+
+[![build](https://github.com/m1nuz/bspm/actions/workflows/smoke.yml/badge.svg?event=push)](https://github.com/m1nuz/bspm/actions/workflows/smoke.yml)
+
 Experimental single-file tool for building C++ with Modules.
 
 `bspm` is intentionally dependency-free: compile `bspm.cpp` with a C++23
@@ -115,7 +118,7 @@ bspm build -v
 Configuration is optional. A folder can always be built directly without a
 config file:
 ```console
-bspm build examples/test3
+bspm build examples/nested-sources
 ```
 
 Use a non-empty `bspm.build` file only when one project contains several related
@@ -144,7 +147,7 @@ bspm clean all
 From outside the project directory, use `--project` to treat a directory as a
 project root instead of as one plain folder target:
 ```console
-bspm build examples/test7 --project
+bspm build examples/project-config --project
 ```
 
 `bspm.build` uses a small shell-like syntax:
@@ -188,6 +191,15 @@ bspm help build
 ```
 
 See `examples/README.md` for a tour of the included example targets.
+
+## Tests
+
+The examples are user-facing demonstrations. CI smoke coverage lives separately
+under `tests/` and can be run with:
+```console
+python tests/smoke.py
+python tests/smoke.py --toolchain clang --level core
+```
 
 ## How to build
 

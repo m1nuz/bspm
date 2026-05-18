@@ -1,0 +1,70 @@
+name: smoke
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-gcc-full:
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-python
+
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Run smoke tests
+        run: python tests/smoke.py --toolchain gcc --level full
+
+  broad-coverage:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-gcc-core
+            os: ubuntu-24.04
+            toolchain: gcc
+          - name: ubuntu-clang-core
+            os: ubuntu-24.04
+            toolchain: clang
+          - name: windows-msvc-core
+            os: windows-2022
+            toolchain: msvc
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Run GCC core smoke tests
+        if: matrix.toolchain == 'gcc'
+        env:
+          CXX: g++-14
+        run: python3 tests/smoke.py --toolchain gcc --level core
+
+      - name: Run Clang core smoke tests
+        if: matrix.toolchain == 'clang'
+        env:
+          CXX: clang++-18
+        run: python3 tests/smoke.py --toolchain clang --level core
+
+      - name: Run MSVC core smoke tests
+        if: matrix.toolchain == 'msvc'
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
+          python tests\smoke.py --toolchain msvc --level core
