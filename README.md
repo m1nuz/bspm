@@ -195,6 +195,7 @@ The examples are user-facing demonstrations. CI smoke coverage lives separately
 under `tests/` and can be run with:
 ```console
 python tests/smoke.py
+python tests/smoke.py --toolchain clang --level core
 ```
 
 ## How to build
