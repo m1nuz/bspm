@@ -1,4 +1,7 @@
 # bspm
+
+[![build](https://github.com/m1nuz/bspm/actions/workflows/smoke.yml/badge.svg?event=push)](https://github.com/m1nuz/bspm/actions/workflows/smoke.yml)
+
 Experimental single-file tool for building C++ with Modules.
 
 `bspm` is intentionally dependency-free: compile `bspm.cpp` with a C++23
