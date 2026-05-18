@@ -25,11 +25,11 @@
 #include <variant>
 #include <vector>
 
-
 namespace fs = std::filesystem;
 
 enum class Target { Bin, Lib, Shared };
 enum class Compiler { GCC, Clang, MSVC };
+enum class ModuleUnitKind { None, PrimaryInterface, Implementation, PartitionInterface, InternalPartition };
 
 constexpr char VersionTag[] = "version";
 constexpr char HelpTag[] = "help";
@@ -82,6 +82,7 @@ std::array BuildOpts {
     DebugOptTag,
     ReleaseOptTag,
     DryRunOptTag,
+    ProjectOptTag,
 };
 
 std::array InitOpts {
@@ -105,12 +106,31 @@ struct CompileUnit {
     std::unordered_set<std::string> std_module_imports;
     std::unordered_set<std::string> module_imports;
     std::string module_name;
+    ModuleUnitKind module_kind { ModuleUnitKind::None };
 
     auto get_dependencies() const -> std::unordered_set<std::string> {
         std::unordered_set<std::string> all_deps = imports;
         all_deps.insert(module_imports.begin(), module_imports.end());
         return all_deps;
     }
+
+    auto declares_module() const -> bool {
+        return module_kind != ModuleUnitKind::None;
+    }
+
+    auto is_importable_module_unit() const -> bool {
+        return module_kind == ModuleUnitKind::PrimaryInterface || module_kind == ModuleUnitKind::PartitionInterface
+            || module_kind == ModuleUnitKind::InternalPartition;
+    }
+
+    auto is_primary_implementation_unit() const -> bool {
+        return module_kind == ModuleUnitKind::Implementation;
+    }
+};
+
+struct ModuleDeclaration {
+    std::string name;
+    ModuleUnitKind kind { ModuleUnitKind::None };
 };
 
 struct ScopedCurrentPath {
@@ -129,7 +149,7 @@ struct ScopedCurrentPath {
 
 struct Context {
 
-    static constexpr std::string_view version { "0.0.5" };
+    static constexpr std::string_view version { "0.0.6" };
     static constexpr std::string_view name { "bspm" };
 
     using Value = std::variant<uint64_t, double, std::string_view>;
@@ -149,6 +169,12 @@ struct Context {
 
     std::vector<std::string> import_sys_headers;
     std::vector<std::string> import_std_modules;
+    std::vector<std::string> dependency_import_sys_headers;
+    std::vector<std::string> dependency_import_std_modules;
+    std::unordered_map<std::string, fs::path> dependency_module_artifacts;
+    std::vector<fs::path> dependency_gcc_cache_dirs;
+    std::vector<fs::path> dependency_link_inputs;
+    std::vector<fs::path> dependency_runtime_inputs;
     bool process_sys_imports { true };
 
     std::vector<CompileUnit> compile_units;
@@ -174,6 +200,17 @@ struct ProjectConfig {
     std::string default_target;
     fs::path root;
     std::vector<TargetConfig> targets;
+};
+
+struct BuiltTargetArtifacts {
+    Compiler compiler { Compiler::GCC };
+    bool debug { true };
+    Target target { Target::Bin };
+    fs::path build_dir;
+    fs::path output_path;
+    std::unordered_map<std::string, fs::path> module_artifacts;
+    std::vector<std::string> import_sys_headers;
+    std::vector<std::string> import_std_modules;
 };
 
 auto configure_target_paths(Context& context, const fs::path& source_dir) -> void;
@@ -340,6 +377,7 @@ auto help_command(Context& context, std::string_view command) -> void {
         std::println("\t--debug\t\t\tBuild with debug flags");
         std::println("\t--release\t\tBuild with optimization flags and NDEBUG");
         std::println("\t--dry-run\t\tPrint compile/link commands without running them");
+        std::println("\t--project\t\tTreat [dir] as a project root containing bspm.build");
         std::println("\t-v\t\t\tPrint commands while building");
         return;
     }
@@ -399,7 +437,8 @@ auto extract_import_names_from_file(std::string_view filename)
     }
 
     std::regex import_sys_regex(R"(^\s*(?:export\s+)?import\s+<([^<>]+)>;)");
-    std::regex import_module_regex(R"(^\s*(?:export\s+)?import\s+([A-Za-z_][A-Za-z0-9_:.]*)\s*;)");
+    std::regex import_module_regex(
+        R"(^\s*(?:export\s+)?import\s+((?::[A-Za-z_][A-Za-z0-9_.]*)|(?:[A-Za-z_][A-Za-z0-9_:.]*))\s*;)");
     std::string line;
 
     while (std::getline(file, line)) {
@@ -435,31 +474,52 @@ auto extract_import_names_from_file(std::string_view filename)
     return { library_names, std_module_names, module_names };
 }
 
-std::string extract_module_name_from_file(std::string_view filename) {
+auto extract_module_declaration_from_file(std::string_view filename) -> ModuleDeclaration {
     std::ifstream file { std::data(filename) };
     if (!file) {
         std::println("Error: failed to open file '{}'", filename);
         return {};
     }
 
-    std::regex module_regex(R"(^\s*export\s+module\s+([A-Za-z_][A-Za-z0-9_:.]*)\s*;)");
+    std::regex module_regex(R"(^\s*(export\s+)?module\s+([A-Za-z_][A-Za-z0-9_:.]*)\s*;)");
     std::string line;
 
     while (std::getline(file, line)) {
         std::smatch match;
         if (std::regex_search(line, match, module_regex)) {
-            return match[1];
+            ModuleDeclaration declaration;
+            declaration.name = match[2];
+
+            const auto exported = match[1].matched;
+            const auto partition = declaration.name.find(':') != std::string::npos;
+            if (exported && partition) {
+                declaration.kind = ModuleUnitKind::PartitionInterface;
+            } else if (exported) {
+                declaration.kind = ModuleUnitKind::PrimaryInterface;
+            } else if (partition) {
+                declaration.kind = ModuleUnitKind::InternalPartition;
+            } else {
+                declaration.kind = ModuleUnitKind::Implementation;
+            }
+
+            return declaration;
         }
     }
 
     return {};
 }
 
-static auto process_units_imports(Context& context, const std::vector<fs::directory_entry>& entries) -> void {
+auto primary_module_name(std::string_view module_name) -> std::string {
+    const auto partition_separator = module_name.find(':');
+    return std::string { module_name.substr(0, partition_separator) };
+}
+
+static auto process_units_imports(Context& context, const std::vector<fs::directory_entry>& entries) -> bool {
     context.compile_units.reserve(std::size(entries));
 
     std::vector<std::string> imports;
     std::vector<std::string> std_module_imports;
+    bool success = true;
 
     for (auto& entry : entries) {
         CompileUnit unit;
@@ -473,7 +533,9 @@ static auto process_units_imports(Context& context, const std::vector<fs::direct
         unit.file_name = unit.relative_path.generic_string();
 
         auto [library_names, std_module_names, module_names] = extract_import_names_from_file(entry.path().string());
-        unit.module_name = extract_module_name_from_file(entry.path().string());
+        const auto declaration = extract_module_declaration_from_file(entry.path().string());
+        unit.module_name = declaration.name;
+        unit.module_kind = declaration.kind;
         if (!library_names.empty()) {
             for (const auto& library_name : library_names) {
                 if (std::find(std::begin(imports), std::end(imports), library_name) == std::end(imports)) {
@@ -492,7 +554,21 @@ static auto process_units_imports(Context& context, const std::vector<fs::direct
         }
 
         if (!module_names.empty()) {
-            unit.module_imports.insert(std::begin(module_names), std::end(module_names));
+            for (const auto& module_name : module_names) {
+                if (!module_name.empty() && module_name.front() == ':') {
+                    if (!unit.declares_module()) {
+                        std::println("Error: '{}' imports local partition '{}' outside a module unit", unit.file_name,
+                            module_name);
+                        success = false;
+                        continue;
+                    }
+
+                    unit.module_imports.insert(primary_module_name(unit.module_name) + module_name);
+                    continue;
+                }
+
+                unit.module_imports.insert(module_name);
+            }
         }
 
         context.compile_units.push_back(unit);
@@ -517,24 +593,44 @@ static auto process_units_imports(Context& context, const std::vector<fs::direct
     std_module_imports.erase(
         std::unique(std::begin(std_module_imports), std::end(std_module_imports)), std::end(std_module_imports));
 
+    imports.insert(std::end(imports), std::begin(context.dependency_import_sys_headers),
+        std::end(context.dependency_import_sys_headers));
+    std::sort(std::begin(imports), std::end(imports));
+    imports.erase(std::unique(std::begin(imports), std::end(imports)), std::end(imports));
+
+    std_module_imports.insert(std::end(std_module_imports), std::begin(context.dependency_import_std_modules),
+        std::end(context.dependency_import_std_modules));
+    std::sort(std::begin(std_module_imports), std::end(std_module_imports), [](const auto& a, const auto& b) {
+        if (a == StdModuleName && b == StdCompatModuleName) {
+            return true;
+        }
+        if (a == StdCompatModuleName && b == StdModuleName) {
+            return false;
+        }
+        return a < b;
+    });
+    std_module_imports.erase(
+        std::unique(std::begin(std_module_imports), std::end(std_module_imports)), std::end(std_module_imports));
+
     context.import_sys_headers = imports;
     context.import_std_modules = std_module_imports;
+    return success;
 }
 
 auto sort_units_by_dependency(Context& context) -> bool {
-    std::unordered_map<std::string, std::size_t> module_to_unit;
+    std::unordered_map<std::string, std::size_t> importable_module_to_unit;
     for (std::size_t i = 0; i < context.compile_units.size(); ++i) {
-        const auto& module_name = context.compile_units[i].module_name;
-        if (module_name.empty()) {
+        const auto& unit = context.compile_units[i];
+        if (!unit.is_importable_module_unit()) {
             continue;
         }
 
-        if (module_to_unit.contains(module_name)) {
-            std::println("Error: module '{}' is defined more than once", module_name);
+        if (importable_module_to_unit.contains(unit.module_name)) {
+            std::println("Error: importable module '{}' is defined more than once", unit.module_name);
             return false;
         }
 
-        module_to_unit[module_name] = i;
+        importable_module_to_unit[unit.module_name] = i;
     }
 
     enum class VisitState { NotVisited, Visiting, Visited };
@@ -542,6 +638,15 @@ auto sort_units_by_dependency(Context& context) -> bool {
     std::vector<VisitState> states(context.compile_units.size(), VisitState::NotVisited);
     std::vector<CompileUnit> sorted_units;
     sorted_units.reserve(context.compile_units.size());
+    std::vector<std::size_t> visit_stack;
+
+    auto dependencies_for_unit = [&](const CompileUnit& unit) {
+        std::unordered_set<std::string> dependencies = unit.module_imports;
+        if (unit.is_primary_implementation_unit()) {
+            dependencies.insert(unit.module_name);
+        }
+        return dependencies;
+    };
 
     std::function<bool(std::size_t)> visit = [&](std::size_t index) {
         if (states[index] == VisitState::Visited) {
@@ -549,20 +654,49 @@ auto sort_units_by_dependency(Context& context) -> bool {
         }
 
         if (states[index] == VisitState::Visiting) {
-            std::println("Error: cyclic module dependency involving '{}'", context.compile_units[index].file_name);
+            auto cycle_start = std::find(std::begin(visit_stack), std::end(visit_stack), index);
+            std::string cycle;
+            for (auto it = cycle_start; it != std::end(visit_stack); ++it) {
+                if (!cycle.empty()) {
+                    cycle += " -> ";
+                }
+                cycle += context.compile_units[*it].file_name;
+            }
+            if (!cycle.empty()) {
+                cycle += " -> ";
+            }
+            cycle += context.compile_units[index].file_name;
+            std::println("Error: cyclic module dependency: {}", cycle);
             return false;
         }
 
         states[index] = VisitState::Visiting;
+        visit_stack.push_back(index);
 
-        for (const auto& dependency : context.compile_units[index].module_imports) {
-            auto it = module_to_unit.find(dependency);
-            if (it != module_to_unit.end() && !visit(it->second)) {
+        const auto& unit = context.compile_units[index];
+        for (const auto& dependency : dependencies_for_unit(unit)) {
+            auto it = importable_module_to_unit.find(dependency);
+            if (it != importable_module_to_unit.end() && !visit(it->second)) {
+                return false;
+            }
+
+            if (it == importable_module_to_unit.end() && unit.is_primary_implementation_unit()
+                && dependency == unit.module_name) {
+                std::println("Error: '{}' implements module '{}' but no primary interface unit was found",
+                    unit.file_name, unit.module_name);
+                return false;
+            }
+
+            if (it == importable_module_to_unit.end() && unit.declares_module()
+                && dependency.find(':') != std::string::npos
+                && primary_module_name(dependency) == primary_module_name(unit.module_name)) {
+                std::println("Error: '{}' imports missing local partition '{}'", unit.file_name, dependency);
                 return false;
             }
         }
 
         states[index] = VisitState::Visited;
+        visit_stack.pop_back();
         sorted_units.push_back(context.compile_units[index]);
         return true;
     };
@@ -584,11 +718,25 @@ auto object_path(const Context& context, fs::path source_path) -> fs::path {
         relative_path = source_path.filename();
     }
 
+    if (relative_path.extension() == ".cppm") {
+        return relative_path.string() + context.object_extension;
+    }
+
     return relative_path.replace_extension(context.object_extension);
 }
 
 auto target_is_library(const Context& context) -> bool {
     return context.target == Target::Lib || context.target == Target::Shared;
+}
+
+auto shared_import_library_name(std::string_view output_name, [[maybe_unused]] Compiler compiler) -> fs::path {
+    fs::path import_library { output_name };
+#if defined(_WIN32) || defined(_WIN64)
+    if (compiler == Compiler::MSVC || compiler == Compiler::Clang) {
+        import_library.replace_extension(".lib");
+    }
+#endif
+    return import_library;
 }
 
 auto clang_module_pcm_path(std::string_view module_name) -> fs::path {
@@ -598,16 +746,50 @@ auto clang_module_pcm_path(std::string_view module_name) -> fs::path {
     return artifact_name;
 }
 
+auto msvc_module_ifc_path(std::string_view module_name) -> fs::path;
+
+auto gcc_module_gcm_path(std::string_view module_name) -> fs::path {
+    std::string artifact_name { module_name };
+    std::replace(artifact_name.begin(), artifact_name.end(), ':', '-');
+    artifact_name += ".gcm";
+    return fs::path { "gcm.cache" } / artifact_name;
+}
+
+auto module_artifact_path(const Context& context, std::string_view module_name) -> fs::path {
+    if (context.compiler == Compiler::Clang) {
+        return context.build_dir / clang_module_pcm_path(module_name);
+    }
+    if (context.compiler == Compiler::MSVC) {
+        return context.build_dir / msvc_module_ifc_path(module_name);
+    }
+    return context.build_dir / gcc_module_gcm_path(module_name);
+}
+
+auto ordered_dependency_module_artifacts(const Context& context) -> std::vector<std::pair<std::string, fs::path>> {
+    std::vector<std::pair<std::string, fs::path>> artifacts(
+        std::begin(context.dependency_module_artifacts), std::end(context.dependency_module_artifacts));
+    std::sort(
+        std::begin(artifacts), std::end(artifacts), [](const auto& a, const auto& b) { return a.first < b.first; });
+    return artifacts;
+}
+
+auto append_dependency_clang_module_references(std::vector<std::string>& args, const Context& context) -> void {
+    for (const auto& [module_name, artifact_path] : ordered_dependency_module_artifacts(context)) {
+        args.push_back(
+            quote_arg(std::string { "-fmodule-file=" } + module_name + "=" + artifact_path.generic_string()));
+    }
+}
+
 auto append_previous_clang_module_references(
     std::vector<std::string>& args, const Context& context, std::size_t unit_index) -> void {
     for (std::size_t i = 0; i < unit_index; ++i) {
-        const auto& module_name = context.compile_units[i].module_name;
-        if (module_name.empty()) {
+        const auto& unit = context.compile_units[i];
+        if (!unit.is_importable_module_unit()) {
             continue;
         }
 
-        args.push_back(
-            std::string { "-fmodule-file=" } + module_name + "=" + clang_module_pcm_path(module_name).generic_string());
+        args.push_back(std::string { "-fmodule-file=" } + unit.module_name + "="
+            + clang_module_pcm_path(unit.module_name).generic_string());
     }
 }
 
@@ -632,7 +814,7 @@ auto std_module_ifc_path(std::string_view module_name) -> fs::path;
 
 auto find_unit_by_module(const Context& context, std::string_view module_name) -> const CompileUnit* {
     for (const auto& unit : context.compile_units) {
-        if (unit.module_name == module_name) {
+        if (unit.is_importable_module_unit() && unit.module_name == module_name) {
             return &unit;
         }
     }
@@ -678,11 +860,18 @@ auto append_msvc_std_module_reference_args(
     }
 }
 
-auto append_msvc_module_reference_args(std::vector<std::string>& args, const std::unordered_set<std::string>& modules)
-    -> void {
-    for (const auto& imported_module : modules) {
+auto append_msvc_module_reference_args(
+    std::vector<std::string>& args, const Context& context, const std::unordered_set<std::string>& modules) -> void {
+    std::vector<std::string> ordered_modules(std::begin(modules), std::end(modules));
+    std::sort(std::begin(ordered_modules), std::end(ordered_modules));
+    for (const auto& imported_module : ordered_modules) {
         args.push_back(std::string { "/reference" });
-        args.push_back(imported_module + "=" + msvc_module_ifc_path(imported_module).string());
+        if (auto artifact = context.dependency_module_artifacts.find(imported_module);
+            artifact != std::end(context.dependency_module_artifacts)) {
+            args.push_back(quote_arg(imported_module + "=" + artifact->second.generic_string()));
+        } else {
+            args.push_back(imported_module + "=" + msvc_module_ifc_path(imported_module).string());
+        }
     }
 }
 
@@ -696,10 +885,13 @@ auto append_msvc_import_args(std::vector<std::string>& args, const Context& cont
         collect_transitive_msvc_dependencies(context, imported_module, visited_modules, headers, std_modules);
         module_references.insert(std::begin(visited_modules), std::end(visited_modules));
     }
+    for (const auto& [module_name, _] : ordered_dependency_module_artifacts(context)) {
+        module_references.insert(module_name);
+    }
 
     append_msvc_header_unit_args(args, headers);
     append_msvc_std_module_reference_args(args, std_modules);
-    append_msvc_module_reference_args(args, module_references);
+    append_msvc_module_reference_args(args, context, module_references);
 }
 
 auto std_module_artifact_name(std::string_view module_name, std::string_view extension) -> fs::path {
@@ -961,6 +1153,57 @@ auto ensure_parent_directory(const fs::path& path) -> bool {
     return true;
 }
 
+auto prepare_dependency_artifacts(const Context& context) -> bool {
+    if (context.dry_run) {
+        return true;
+    }
+
+    if (context.compiler == Compiler::GCC) {
+        const auto destination_cache = context.build_dir / "gcm.cache";
+        std::error_code ec;
+        for (const auto& source_cache : context.dependency_gcc_cache_dirs) {
+            if (!fs::exists(source_cache, ec)) {
+                std::println("Error: dependency module cache '{}' does not exist", source_cache.string());
+                return false;
+            }
+
+            fs::create_directories(destination_cache, ec);
+            if (ec) {
+                std::println("Error: couldn't create '{}': {}", destination_cache.string(), ec.message());
+                return false;
+            }
+
+            fs::copy(source_cache, destination_cache,
+                fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+            if (ec) {
+                std::println("Error: couldn't copy dependency module cache from '{}' to '{}': {}",
+                    source_cache.string(), destination_cache.string(), ec.message());
+                return false;
+            }
+        }
+    }
+
+#if defined(_WIN32) || defined(_WIN64)
+    for (const auto& runtime_input : context.dependency_runtime_inputs) {
+        std::error_code ec;
+        if (!fs::exists(runtime_input, ec)) {
+            std::println("Error: dependency runtime file '{}' does not exist", runtime_input.string());
+            return false;
+        }
+
+        const auto destination = context.build_dir / runtime_input.filename();
+        fs::copy_file(runtime_input, destination, fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            std::println("Error: couldn't copy dependency runtime file from '{}' to '{}': {}", runtime_input.string(),
+                destination.string(), ec.message());
+            return false;
+        }
+    }
+#endif
+
+    return true;
+}
+
 auto build_command(Context& context, fs::path dir) -> bool {
     dir = !dir.empty() ? dir : ".";
 
@@ -992,7 +1235,9 @@ auto build_command(Context& context, fs::path dir) -> bool {
         return (a_ec ? a.path() : a_path).generic_string() < (b_ec ? b.path() : b_path).generic_string();
     });
 
-    process_units_imports(context, entries);
+    if (!process_units_imports(context, entries)) {
+        return false;
+    }
 
     if (!sort_units_by_dependency(context)) {
         return false;
@@ -1006,6 +1251,10 @@ auto build_command(Context& context, fs::path dir) -> bool {
     fs::create_directories(context.build_dir, build_dir_ec);
     if (build_dir_ec) {
         std::println("Error: couldn't create '{}': {}", context.build_dir.string(), build_dir_ec.message());
+        return false;
+    }
+
+    if (!prepare_dependency_artifacts(context)) {
         return false;
     }
 
@@ -1070,7 +1319,12 @@ auto build_command(Context& context, fs::path dir) -> bool {
         }
 
         auto extension = entry_path.extension().string();
-        if (extension == ".cpp") {
+        if (extension == ".cppm" && !unit.declares_module()) {
+            std::println("Error: '{}' uses the .cppm extension but does not declare a module unit", unit.file_name);
+            return false;
+        }
+
+        if (!unit.is_importable_module_unit()) {
             std::vector<std::string> args;
 
             args.push_back(context.cpp_standard);
@@ -1099,10 +1353,15 @@ auto build_command(Context& context, fs::path dir) -> bool {
                         + std_module_pcm_path(imported_std_module).generic_string());
                 }
 
+                append_dependency_clang_module_references(args, context);
                 append_previous_clang_module_references(args, context, unit_index);
             }
 
             if (context.compiler != Compiler::MSVC) {
+                if (extension == ".cppm") {
+                    args.push_back(std::string { "-xc++" });
+                }
+
                 args.push_back(std::string { "-c" });
                 args.push_back(path_arg(unit.file_path));
                 args.push_back(std::string { "-o" });
@@ -1112,21 +1371,20 @@ auto build_command(Context& context, fs::path dir) -> bool {
             if (!execute_command(context, context.cpp_c, args)) {
                 return false;
             }
-        } else if (extension == ".cppm") {
+        } else {
             std::vector<std::string> args;
 
             args.push_back(context.cpp_standard);
             args.push_back(context.cpp_flags);
 
             if (context.compiler == Compiler::MSVC) {
-                if (unit.module_name.empty()) {
-                    std::println("Error: '{}' does not declare an exported module", unit.file_name);
-                    return false;
-                }
-
                 args.push_back(std::string { "/c" });
                 args.push_back(std::string { "/TP" });
-                args.push_back(std::string { "/interface" });
+                if (unit.module_kind == ModuleUnitKind::InternalPartition) {
+                    args.push_back(std::string { "/internalPartition" });
+                } else {
+                    args.push_back(std::string { "/interface" });
+                }
 
                 append_msvc_import_args(args, context, unit);
 
@@ -1135,11 +1393,6 @@ auto build_command(Context& context, fs::path dir) -> bool {
                 args.push_back(std::string { "/Fo" } + unit_object_path.string());
                 args.push_back(path_arg(unit.file_path));
             } else if (context.compiler == Compiler::Clang) {
-                if (unit.module_name.empty()) {
-                    std::println("Error: '{}' does not declare an exported module", unit.file_name);
-                    return false;
-                }
-
                 args.push_back(std::string { "-xc++" });
                 args.push_back(std::string { "-xc++-module" });
                 args.push_back(std::string { "--precompile" });
@@ -1157,6 +1410,7 @@ auto build_command(Context& context, fs::path dir) -> bool {
                         + std_module_pcm_path(imported_std_module).generic_string());
                 }
 
+                append_dependency_clang_module_references(args, context);
                 append_previous_clang_module_references(args, context, unit_index);
 
                 args.push_back(path_arg(unit.file_path));
@@ -1172,6 +1426,7 @@ auto build_command(Context& context, fs::path dir) -> bool {
                     context.cpp_flags,
                 };
 
+                append_dependency_clang_module_references(object_args, context);
                 append_previous_clang_module_references(object_args, context, unit_index);
 
                 object_args.push_back(std::string { "-c" });
@@ -1217,6 +1472,12 @@ auto build_command(Context& context, fs::path dir) -> bool {
         }
     }
 
+    if (context.target != Target::Lib) {
+        for (const auto& dependency_link_input : context.dependency_link_inputs) {
+            link_entries.push_back(path_arg(dependency_link_input));
+        }
+    }
+
     if (!ensure_parent_directory(fs::path { context.output_name })) {
         return false;
     }
@@ -1242,6 +1503,12 @@ auto build_command(Context& context, fs::path dir) -> bool {
                 link_args.push_back("/LD");
             } else {
                 link_args.push_back("-shared");
+#if defined(_WIN32) || defined(_WIN64)
+                if (context.compiler == Compiler::Clang) {
+                    link_args.push_back(std::string { "-Wl,/implib:" }
+                        + shared_import_library_name(context.output_name, context.compiler).generic_string());
+                }
+#endif
             }
         }
 
@@ -2053,6 +2320,114 @@ auto create_target_context(const TargetConfig& target, std::span<const std::stri
     return true;
 }
 
+auto collect_built_target_artifacts(const Context& context) -> BuiltTargetArtifacts {
+    BuiltTargetArtifacts artifacts;
+    artifacts.compiler = context.compiler;
+    artifacts.debug = context.debug;
+    artifacts.target = context.target;
+    artifacts.build_dir = context.build_dir;
+    artifacts.output_path = context.build_dir / context.output_name;
+    artifacts.import_sys_headers = context.import_sys_headers;
+    artifacts.import_std_modules = context.import_std_modules;
+
+    for (const auto& unit : context.compile_units) {
+        if (unit.is_importable_module_unit()) {
+            artifacts.module_artifacts[unit.module_name] = module_artifact_path(context, unit.module_name);
+        }
+    }
+
+    return artifacts;
+}
+
+auto shared_link_input_path(const BuiltTargetArtifacts& artifacts) -> fs::path {
+#if defined(_WIN32) || defined(_WIN64)
+    if (artifacts.compiler == Compiler::MSVC || artifacts.compiler == Compiler::Clang) {
+        return artifacts.build_dir
+            / shared_import_library_name(artifacts.output_path.filename().string(), artifacts.compiler);
+    }
+#endif
+    return artifacts.output_path;
+}
+
+auto append_unique_path(std::vector<fs::path>& paths, const fs::path& path) -> void {
+    if (std::find(std::begin(paths), std::end(paths), path) == std::end(paths)) {
+        paths.push_back(path);
+    }
+}
+
+auto merge_dependency_artifacts(Context& context, const BuiltTargetArtifacts& artifacts) -> bool {
+    if (artifacts.compiler != context.compiler || artifacts.debug != context.debug) {
+        std::println("Error: dependency artifacts were built with a different compiler profile");
+        return false;
+    }
+
+    for (const auto& [module_name, artifact_path] : artifacts.module_artifacts) {
+        if (auto existing = context.dependency_module_artifacts.find(module_name);
+            existing != std::end(context.dependency_module_artifacts) && existing->second != artifact_path) {
+            std::println("Error: dependency module '{}' is provided by more than one target", module_name);
+            return false;
+        }
+        context.dependency_module_artifacts[module_name] = artifact_path;
+    }
+
+    context.dependency_import_sys_headers.insert(std::end(context.dependency_import_sys_headers),
+        std::begin(artifacts.import_sys_headers), std::end(artifacts.import_sys_headers));
+    context.dependency_import_std_modules.insert(std::end(context.dependency_import_std_modules),
+        std::begin(artifacts.import_std_modules), std::end(artifacts.import_std_modules));
+
+    if (context.compiler == Compiler::GCC && !artifacts.module_artifacts.empty()) {
+        append_unique_path(context.dependency_gcc_cache_dirs, artifacts.build_dir / "gcm.cache");
+    }
+
+    if (artifacts.target == Target::Lib) {
+        append_unique_path(context.dependency_link_inputs, artifacts.output_path);
+    } else if (artifacts.target == Target::Shared) {
+        append_unique_path(context.dependency_link_inputs, shared_link_input_path(artifacts));
+        append_unique_path(context.dependency_runtime_inputs, artifacts.output_path);
+    }
+
+    return true;
+}
+
+auto collect_target_dependency_artifacts(const ProjectConfig& project, const TargetConfig& target,
+    const std::unordered_map<std::string, BuiltTargetArtifacts>& built_artifacts, Context& context) -> bool {
+    std::unordered_set<std::string> visited_targets;
+
+    std::function<bool(const TargetConfig&)> visit = [&](const TargetConfig& dependency) {
+        if (!visited_targets.insert(dependency.name).second) {
+            return true;
+        }
+
+        auto artifacts = built_artifacts.find(dependency.name);
+        if (artifacts == std::end(built_artifacts)) {
+            std::println("Error: dependency target '{}' has not been built yet", dependency.name);
+            return false;
+        }
+
+        if (!merge_dependency_artifacts(context, artifacts->second)) {
+            return false;
+        }
+
+        for (const auto& nested_dependency_name : dependency.dependencies) {
+            const auto* nested_dependency = find_target(project, nested_dependency_name);
+            if (!nested_dependency || !visit(*nested_dependency)) {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    for (const auto& dependency_name : target.dependencies) {
+        const auto* dependency = find_target(project, dependency_name);
+        if (!dependency || !visit(*dependency)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 auto collect_project_build_order(const ProjectConfig& project, std::span<const std::string_view> requested_targets,
     std::vector<const TargetConfig*>& order) -> bool {
     enum class VisitState { Visiting, Visited };
@@ -2101,14 +2476,20 @@ auto build_project(const ProjectConfig& project, std::span<const std::string_vie
         return false;
     }
 
+    std::unordered_map<std::string, BuiltTargetArtifacts> built_artifacts;
+
     for (const auto* target : build_order) {
         Context target_context;
         if (!create_target_context(*target, cli_options, target_context)) {
             return false;
         }
+        if (!collect_target_dependency_artifacts(project, *target, built_artifacts, target_context)) {
+            return false;
+        }
         if (!build_command(target_context, project.root / target->path)) {
             return false;
         }
+        built_artifacts[target->name] = collect_built_target_artifacts(target_context);
     }
 
     return true;
@@ -2158,8 +2539,8 @@ auto clean_project_targets(const ProjectConfig& project, std::span<const std::st
     return true;
 }
 
-auto load_project_config_if_present(ProjectConfig& project, bool& present) -> bool {
-    const auto config_path = fs::current_path() / "bspm.build";
+auto load_project_config_if_present(ProjectConfig& project, bool& present, fs::path root = fs::current_path()) -> bool {
+    const auto config_path = fs::absolute(root) / "bspm.build";
     std::error_code ec;
     if (!fs::is_regular_file(config_path, ec) || fs::file_size(config_path, ec) == 0) {
         present = false;
@@ -2181,6 +2562,10 @@ auto project_target_names(const ProjectConfig& project) -> std::vector<std::stri
 
 auto has_project_target(const ProjectConfig& project, std::string_view name) -> bool {
     return find_target(project, name) != nullptr;
+}
+
+auto contains_option(std::span<const std::string_view> options, std::string_view option) -> bool {
+    return std::find(std::begin(options), std::end(options), option) != std::end(options);
 }
 
 int main(int argc, char* argv[]) {
@@ -2226,12 +2611,36 @@ int main(int argc, char* argv[]) {
             cli_options.push_back(argv[idx]);
         }
 
+        const bool force_project = contains_option(cli_options, ProjectOptTag);
+        if (force_project) {
+            ProjectConfig explicit_project;
+            bool explicit_project_present = false;
+            const auto project_root = dir.empty() ? fs::current_path() : dir;
+            if (!load_project_config_if_present(explicit_project, explicit_project_present, project_root)) {
+                if (!explicit_project_present) {
+                    std::println(
+                        "Error: '{}' does not contain a non-empty bspm.build", fs::absolute(project_root).string());
+                }
+                return 1;
+            }
+
+            project = std::move(explicit_project);
+            project_present = true;
+        }
+
         const auto subject = dir.generic_string();
-        const bool use_project
-            = project_present && (dir.empty() || subject == "all" || has_project_target(project, subject));
+        const bool use_project = force_project
+            || (project_present && (dir.empty() || subject == "all" || has_project_target(project, subject)));
         if (use_project) {
             std::vector<std::string_view> requested_targets;
-            if (subject == "all") {
+            if (force_project) {
+                if (!project.default_target.empty()) {
+                    requested_targets.push_back(project.default_target);
+                } else {
+                    std::println("Error: project does not define a default target");
+                    return 1;
+                }
+            } else if (subject == "all") {
                 requested_targets = project_target_names(project);
             } else if (!dir.empty()) {
                 requested_targets.push_back(subject);
