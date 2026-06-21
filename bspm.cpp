@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -10,9 +12,11 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <future>
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <mutex>
 #include <print>
 #include <regex>
 #include <span>
@@ -24,6 +28,19 @@
 #include <unordered_set>
 #include <variant>
 #include <vector>
+
+#if defined(_WIN32) || defined(_WIN64)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -70,6 +87,8 @@ constexpr std::string_view ReleaseOptTag { "--release" };
 constexpr std::string_view DryRunOptTag { "--dry-run" };
 constexpr std::string_view DependsOptTag { "--depends" };
 constexpr std::string_view ProjectOptTag { "--project" };
+constexpr std::string_view JobsOptTag { "-j" };
+constexpr std::string_view LongJobsOptTag { "--jobs" };
 
 std::array BuildOpts {
     BinaryOptTag,
@@ -83,6 +102,8 @@ std::array BuildOpts {
     ReleaseOptTag,
     DryRunOptTag,
     ProjectOptTag,
+    JobsOptTag,
+    LongJobsOptTag,
 };
 
 std::array InitOpts {
@@ -131,6 +152,12 @@ struct CompileUnit {
 struct ModuleDeclaration {
     std::string name;
     ModuleUnitKind kind { ModuleUnitKind::None };
+};
+
+struct BuildState {
+    fs::path path;
+    std::unordered_map<std::string, std::string> signatures;
+    bool dirty { false };
 };
 
 struct ScopedCurrentPath {
@@ -186,6 +213,10 @@ struct Context {
     bool dry_run { false };
     bool output_name_configured { false };
     bool project_init { false };
+    std::size_t jobs { 1 };
+    BuildState build_state;
+    std::mutex build_state_mutex;
+    std::mutex output_mutex;
 };
 
 struct TargetConfig {
@@ -237,6 +268,12 @@ auto quote_arg(std::string_view arg) -> std::string {
 auto path_arg(const fs::path& path) -> std::string {
     return quote_arg(path.generic_string());
 }
+
+struct ProcessInvocation {
+    std::string executable;
+    std::vector<std::string> args;
+    std::string display_command;
+};
 
 auto find_file_recursively(const fs::path& root, std::string_view filename) -> fs::path {
     std::error_code ec;
@@ -302,30 +339,444 @@ auto wrap_msvc_command(const Context& context, std::string_view command) -> std:
     return wrapped;
 }
 
-auto execute_command(Context& context, std::string_view command, std::span<const std::string> args) -> bool {
-    std::string raw_command { command };
-    for (const auto& arg : args) {
-        raw_command += " " + arg;
+auto split_argument_tokens(std::string_view value, std::vector<std::string>& tokens) -> bool {
+    std::string token;
+    bool in_quotes = false;
+    bool escaped = false;
+
+    auto flush_token = [&] {
+        if (!token.empty()) {
+            tokens.push_back(std::move(token));
+            token.clear();
+        }
+    };
+
+    for (char ch : value) {
+        if (escaped) {
+            token.push_back(ch);
+            escaped = false;
+            continue;
+        }
+
+        if (in_quotes && ch == '\\') {
+            escaped = true;
+            continue;
+        }
+
+        if (ch == '"') {
+            in_quotes = !in_quotes;
+            continue;
+        }
+
+        if (!in_quotes && std::isspace(static_cast<unsigned char>(ch))) {
+            flush_token();
+            continue;
+        }
+
+        token.push_back(ch);
     }
 
-    std::string full_command = wrap_msvc_command(context, raw_command);
+    if (escaped || in_quotes) {
+        return false;
+    }
+
+    flush_token();
+    return true;
+}
+
+auto normalize_process_args(std::span<const std::string> args, std::vector<std::string>& normalized) -> bool {
+    for (const auto& arg : args) {
+        if (!split_argument_tokens(arg, normalized)) {
+            std::println("Error: invalid quoted command argument '{}'", arg);
+            return false;
+        }
+    }
+    return true;
+}
+
+auto render_command(std::string_view command, std::span<const std::string> args) -> std::string {
+    std::string rendered { quote_arg(command) };
+    for (const auto& arg : args) {
+        rendered += " ";
+        rendered += quote_arg(arg);
+    }
+    return rendered;
+}
+
+auto make_process_invocation(
+    const Context& context, std::string_view command, std::span<const std::string> args) -> ProcessInvocation {
+    ProcessInvocation invocation;
+    invocation.executable = command;
+    if (!normalize_process_args(args, invocation.args)) {
+        return {};
+    }
+
+    invocation.display_command = render_command(command, invocation.args);
+    if (context.compiler == Compiler::MSVC && !context.msvc_dev_cmd.empty()) {
+        invocation.executable = "cmd.exe";
+        invocation.args = { "/D", "/S", "/C", wrap_msvc_command(context, invocation.display_command) };
+        invocation.display_command = invocation.args.back();
+    }
+    return invocation;
+}
+
+auto quote_windows_process_arg(std::string_view arg) -> std::string {
+    const bool needs_quotes
+        = arg.empty() || arg.find_first_of(" \t\n\v\"") != std::string_view::npos;
+    if (!needs_quotes) {
+        return std::string { arg };
+    }
+
+    std::string quoted;
+    quoted.push_back('"');
+    std::size_t backslashes = 0;
+
+    for (char ch : arg) {
+        if (ch == '\\') {
+            ++backslashes;
+            continue;
+        }
+
+        if (ch == '"') {
+            quoted.append(backslashes * 2 + 1, '\\');
+            quoted.push_back('"');
+            backslashes = 0;
+            continue;
+        }
+
+        quoted.append(backslashes, '\\');
+        backslashes = 0;
+        quoted.push_back(ch);
+    }
+
+    quoted.append(backslashes * 2, '\\');
+    quoted.push_back('"');
+    return quoted;
+}
+
+auto spawn_process(const std::string& executable, std::span<const std::string> args) -> int {
+    std::vector<std::string> argv_storage;
+    argv_storage.reserve(args.size() + 1);
+    argv_storage.push_back(executable);
+    argv_storage.insert(std::end(argv_storage), std::begin(args), std::end(args));
+
+#if defined(_WIN32) || defined(_WIN64)
+    std::string command_line;
+    for (const auto& arg : argv_storage) {
+        if (!command_line.empty()) {
+            command_line.push_back(' ');
+        }
+        command_line += quote_windows_process_arg(arg);
+    }
+
+    STARTUPINFOA startup_info {};
+    PROCESS_INFORMATION process_info {};
+    startup_info.cb = sizeof(startup_info);
+
+    const BOOL created = CreateProcessA(nullptr, command_line.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr,
+        &startup_info, &process_info);
+    if (!created) {
+        return static_cast<int>(GetLastError());
+    }
+
+    WaitForSingleObject(process_info.hProcess, INFINITE);
+
+    DWORD exit_code = 1;
+    if (!GetExitCodeProcess(process_info.hProcess, &exit_code)) {
+        exit_code = GetLastError();
+    }
+
+    CloseHandle(process_info.hThread);
+    CloseHandle(process_info.hProcess);
+    return static_cast<int>(exit_code);
+#else
+    std::vector<char*> argv;
+    argv.reserve(argv_storage.size() + 1);
+    for (auto& arg : argv_storage) {
+        argv.push_back(arg.data());
+    }
+    argv.push_back(nullptr);
+
+    const pid_t pid = fork();
+    if (pid == -1) {
+        return errno == 0 ? 1 : errno;
+    }
+
+    if (pid == 0) {
+        execvp(executable.c_str(), argv.data());
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) == -1) {
+        return errno == 0 ? 1 : errno;
+    }
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status)) {
+        return 128 + WTERMSIG(status);
+    }
+    return status;
+#endif
+}
+
+auto execute_process_invocation(Context& context, const ProcessInvocation& invocation) -> bool {
+    if (invocation.executable.empty()) {
+        return false;
+    }
 
     if (context.verbose) {
-        std::println("command: {}", full_command);
+        std::scoped_lock lock { context.output_mutex };
+        std::println("command: {}", invocation.display_command);
         std::fflush(stdout);
     }
 
     if (context.dry_run) {
         if (!context.verbose) {
-            std::println("command: {}", full_command);
+            std::scoped_lock lock { context.output_mutex };
+            std::println("command: {}", invocation.display_command);
         }
         return true;
     }
 
-    const int status = std::system(std::data(full_command));
+    const int status = spawn_process(invocation.executable, invocation.args);
     if (status != 0) {
         std::println("Error: command failed with status {}", status);
         return false;
+    }
+
+    return true;
+}
+
+auto execute_command(Context& context, std::string_view command, std::span<const std::string> args) -> bool {
+    const auto invocation = make_process_invocation(context, command, args);
+    return execute_process_invocation(context, invocation);
+}
+
+auto encode_state_field(std::string_view value) -> std::string {
+    std::string encoded;
+    encoded.reserve(value.size());
+    for (char ch : value) {
+        if (ch == '\\') {
+            encoded += "\\\\";
+        } else if (ch == '\t') {
+            encoded += "\\t";
+        } else if (ch == '\n') {
+            encoded += "\\n";
+        } else if (ch == '\r') {
+            encoded += "\\r";
+        } else {
+            encoded.push_back(ch);
+        }
+    }
+    return encoded;
+}
+
+auto decode_state_field(std::string_view value, bool& ok) -> std::string {
+    std::string decoded;
+    decoded.reserve(value.size());
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        const char ch = value[index];
+        if (ch != '\\') {
+            decoded.push_back(ch);
+            continue;
+        }
+
+        if (index + 1 >= value.size()) {
+            ok = false;
+            return {};
+        }
+
+        const char escaped = value[++index];
+        if (escaped == '\\') {
+            decoded.push_back('\\');
+        } else if (escaped == 't') {
+            decoded.push_back('\t');
+        } else if (escaped == 'n') {
+            decoded.push_back('\n');
+        } else if (escaped == 'r') {
+            decoded.push_back('\r');
+        } else {
+            ok = false;
+            return {};
+        }
+    }
+    return decoded;
+}
+
+auto state_key_for_path(const fs::path& path) -> std::string {
+    return path.lexically_normal().generic_string();
+}
+
+auto load_build_state(Context& context) -> bool {
+    context.build_state.path = context.build_dir / ".bspm-state";
+    context.build_state.signatures.clear();
+    context.build_state.dirty = false;
+
+    std::ifstream file { context.build_state.path };
+    if (!file) {
+        return true;
+    }
+
+    std::string line;
+    if (!std::getline(file, line) || line != "bspm-state-v1") {
+        return true;
+    }
+
+    while (std::getline(file, line)) {
+        const auto separator = line.find('\t');
+        if (separator == std::string::npos) {
+            continue;
+        }
+
+        bool ok = true;
+        auto key = decode_state_field(std::string_view { line }.substr(0, separator), ok);
+        if (!ok) {
+            continue;
+        }
+
+        auto signature = decode_state_field(std::string_view { line }.substr(separator + 1), ok);
+        if (!ok) {
+            continue;
+        }
+
+        context.build_state.signatures[std::move(key)] = std::move(signature);
+    }
+
+    return true;
+}
+
+auto save_build_state(Context& context) -> bool {
+    if (context.dry_run || !context.build_state.dirty) {
+        return true;
+    }
+
+    std::ofstream file { context.build_state.path };
+    if (!file) {
+        std::println("Error: failed to write '{}'", context.build_state.path.string());
+        return false;
+    }
+
+    std::vector<std::string> keys;
+    keys.reserve(context.build_state.signatures.size());
+    for (const auto& [key, _] : context.build_state.signatures) {
+        keys.push_back(key);
+    }
+    std::sort(std::begin(keys), std::end(keys));
+
+    file << "bspm-state-v1\n";
+    for (const auto& key : keys) {
+        file << encode_state_field(key) << '\t' << encode_state_field(context.build_state.signatures[key]) << '\n';
+    }
+
+    return true;
+}
+
+auto oldest_output_time(std::span<const fs::path> outputs, fs::file_time_type& oldest_time) -> bool {
+    bool found = false;
+    for (const auto& output : outputs) {
+        std::error_code ec;
+        if (!fs::is_regular_file(output, ec)) {
+            return false;
+        }
+
+        auto modified_at = fs::last_write_time(output, ec);
+        if (ec) {
+            return false;
+        }
+
+        if (!found || modified_at < oldest_time) {
+            oldest_time = modified_at;
+            found = true;
+        }
+    }
+
+    return found;
+}
+
+auto inputs_are_not_newer_than(const fs::file_time_type& output_time, std::span<const fs::path> inputs) -> bool {
+    for (const auto& input : inputs) {
+        if (input.empty()) {
+            continue;
+        }
+
+        std::error_code ec;
+        if (!fs::exists(input, ec)) {
+            return false;
+        }
+
+        auto modified_at = fs::last_write_time(input, ec);
+        if (ec || modified_at > output_time) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+auto build_step_signature(
+    const std::string& command, std::span<const fs::path> outputs, std::span<const fs::path> inputs) -> std::string {
+    std::string signature = command;
+    signature += "\noutputs:";
+    for (const auto& output : outputs) {
+        signature += "\n";
+        signature += output.lexically_normal().generic_string();
+    }
+    signature += "\ninputs:";
+    for (const auto& input : inputs) {
+        signature += "\n";
+        signature += input.lexically_normal().generic_string();
+    }
+    return signature;
+}
+
+auto step_is_up_to_date(Context& context, std::span<const fs::path> outputs, std::span<const fs::path> inputs,
+    const std::string& signature) -> bool {
+    if (outputs.empty()) {
+        return false;
+    }
+
+    const auto key = state_key_for_path(outputs.front());
+    std::scoped_lock lock { context.build_state_mutex };
+    auto it = context.build_state.signatures.find(key);
+    if (it == std::end(context.build_state.signatures) || it->second != signature) {
+        return false;
+    }
+
+    fs::file_time_type output_time {};
+    return oldest_output_time(outputs, output_time) && inputs_are_not_newer_than(output_time, inputs);
+}
+
+auto record_build_step(Context& context, std::span<const fs::path> outputs, const std::string& signature) -> void {
+    if (outputs.empty()) {
+        return;
+    }
+
+    std::scoped_lock lock { context.build_state_mutex };
+    context.build_state.signatures[state_key_for_path(outputs.front())] = signature;
+    context.build_state.dirty = true;
+}
+
+auto execute_incremental_command(Context& context, std::string_view command, std::span<const std::string> args,
+    std::span<const fs::path> outputs, std::span<const fs::path> inputs, std::string_view label) -> bool {
+    const auto invocation = make_process_invocation(context, command, args);
+    const auto signature = build_step_signature(invocation.display_command, outputs, inputs);
+
+    if (!context.dry_run && step_is_up_to_date(context, outputs, inputs, signature)) {
+        if (context.verbose) {
+            std::scoped_lock lock { context.output_mutex };
+            std::println("up to date: {}", label);
+        }
+        return true;
+    }
+
+    if (!execute_process_invocation(context, invocation)) {
+        return false;
+    }
+
+    if (!context.dry_run) {
+        record_build_step(context, outputs, signature);
     }
 
     return true;
@@ -378,6 +829,7 @@ auto help_command(Context& context, std::string_view command) -> void {
         std::println("\t--release\t\tBuild with optimization flags and NDEBUG");
         std::println("\t--dry-run\t\tPrint compile/link commands without running them");
         std::println("\t--project\t\tTreat [dir] as a project root containing bspm.build");
+        std::println("\t-j, --jobs <count>\tCompile independent source files in parallel");
         std::println("\t-v\t\t\tPrint commands while building");
         return;
     }
@@ -979,6 +1431,8 @@ auto prepare_std_module_imports(Context& context) -> bool {
 
     for (const auto& module_name : context.import_std_modules) {
         if (context.compiler == Compiler::GCC) {
+            // GCC chooses implementation-specific paths under gcm.cache for standard modules.
+            // Keep this step eager until those artifacts can be identified portably.
             if (!execute_command(context, context.cpp_c,
                     std::array { context.cpp_standard, context.cpp_flags, std::string { "-fsearch-include-path" },
                         std::string { "-c" }, gcc_std_module_source(module_name) })) {
@@ -1017,7 +1471,14 @@ auto prepare_std_module_imports(Context& context) -> bool {
             args.push_back("-o");
             args.push_back(path_arg(std_module_pcm_path(module_name)));
 
-            if (!execute_command(context, context.cpp_c, args)) {
+            std::vector<fs::path> outputs { std_module_pcm_path(module_name) };
+            std::vector<fs::path> inputs { source };
+            if (module_name == StdCompatModuleName) {
+                inputs.push_back(std_module_pcm_path(StdModuleName));
+            }
+
+            if (!execute_incremental_command(context, context.cpp_c, args, outputs, inputs,
+                    std::string { "standard module " } + module_name)) {
                 return false;
             }
         } else if (context.compiler == Compiler::MSVC) {
@@ -1045,7 +1506,14 @@ auto prepare_std_module_imports(Context& context) -> bool {
             args.push_back(std_module_ifc_path(module_name).string());
             args.push_back(std::string { "/Fo" } + std_module_object_path(module_name).string());
 
-            if (!execute_command(context, context.cpp_c, args)) {
+            std::vector<fs::path> outputs { std_module_ifc_path(module_name), std_module_object_path(module_name) };
+            std::vector<fs::path> inputs { source };
+            if (module_name == StdCompatModuleName) {
+                inputs.push_back(std_module_ifc_path(StdModuleName));
+            }
+
+            if (!execute_incremental_command(context, context.cpp_c, args, outputs, inputs,
+                    std::string { "standard module " } + module_name)) {
                 return false;
             }
         }
@@ -1204,6 +1672,79 @@ auto prepare_dependency_artifacts(const Context& context) -> bool {
     return true;
 }
 
+auto append_previous_module_artifact_inputs(
+    std::vector<fs::path>& inputs, const Context& context, std::size_t unit_index) -> void {
+    for (std::size_t i = 0; i < unit_index; ++i) {
+        const auto& dependency_unit = context.compile_units[i];
+        if (dependency_unit.is_importable_module_unit()) {
+            inputs.push_back(module_artifact_path(context, dependency_unit.module_name));
+        }
+    }
+}
+
+auto append_dependency_artifact_inputs(std::vector<fs::path>& inputs, const Context& context) -> void {
+    for (const auto& [_, artifact_path] : ordered_dependency_module_artifacts(context)) {
+        inputs.push_back(artifact_path);
+    }
+}
+
+auto append_header_unit_inputs(std::vector<fs::path>& inputs, const Context& context, const CompileUnit& unit) -> void {
+    if (context.compiler == Compiler::Clang) {
+        for (const auto& header : unit.imports) {
+            fs::path header_path { header };
+            inputs.push_back((fs::path { ".cache" } / header_path).replace_extension(".pcm"));
+        }
+    } else if (context.compiler == Compiler::MSVC) {
+        for (const auto& header : unit.imports) {
+            inputs.push_back(msvc_header_ifc_path(header));
+        }
+    }
+}
+
+auto append_std_module_inputs(std::vector<fs::path>& inputs, const Context& context, const CompileUnit& unit) -> void {
+    if (context.compiler == Compiler::Clang) {
+        for (const auto& module_name : unit.std_module_imports) {
+            inputs.push_back(std_module_pcm_path(module_name));
+        }
+    } else if (context.compiler == Compiler::MSVC) {
+        for (const auto& module_name : unit.std_module_imports) {
+            inputs.push_back(std_module_ifc_path(module_name));
+        }
+    }
+}
+
+auto compile_unit_inputs(const Context& context, const CompileUnit& unit, std::size_t unit_index)
+    -> std::vector<fs::path> {
+    std::vector<fs::path> inputs { unit.file_path };
+    append_header_unit_inputs(inputs, context, unit);
+    append_std_module_inputs(inputs, context, unit);
+    append_previous_module_artifact_inputs(inputs, context, unit_index);
+    append_dependency_artifact_inputs(inputs, context);
+    return inputs;
+}
+
+auto compile_unit_outputs(const Context& context, const CompileUnit& unit, const fs::path& unit_object_path)
+    -> std::vector<fs::path> {
+    std::vector<fs::path> outputs { unit_object_path };
+    if (unit.is_importable_module_unit()) {
+        outputs.push_back(module_artifact_path(context, unit.module_name));
+    }
+    return outputs;
+}
+
+auto link_outputs(const Context& context) -> std::vector<fs::path> {
+    std::vector<fs::path> outputs { context.output_name };
+#if defined(_WIN32) || defined(_WIN64)
+    if (context.target == Target::Shared && (context.compiler == Compiler::MSVC || context.compiler == Compiler::Clang)) {
+        const auto import_library = shared_import_library_name(context.output_name, context.compiler);
+        if (import_library != context.output_name) {
+            outputs.push_back(import_library);
+        }
+    }
+#endif
+    return outputs;
+}
+
 auto build_command(Context& context, fs::path dir) -> bool {
     dir = !dir.empty() ? dir : ".";
 
@@ -1254,6 +1795,10 @@ auto build_command(Context& context, fs::path dir) -> bool {
         return false;
     }
 
+    if (!load_build_state(context)) {
+        return false;
+    }
+
     if (!prepare_dependency_artifacts(context)) {
         return false;
     }
@@ -1284,11 +1829,19 @@ auto build_command(Context& context, fs::path dir) -> bool {
                 }
             } else if (context.compiler == Compiler::Clang) {
                 fs::path header_path { header };
+                auto output_path = (fs::path { ".cache" } / header_path).replace_extension(".pcm");
+                if (!ensure_parent_directory(output_path)) {
+                    return false;
+                }
 
-                if (!execute_command(context, context.cpp_c,
-                        std::array { context.cpp_standard, context.cpp_flags,
-                            std::string { "-xc++-system-header --precompile" }, header, std::string { "-o" },
-                            (".cache" / header_path).replace_extension(".pcm").string() })) {
+                std::array args { context.cpp_standard, context.cpp_flags,
+                    std::string { "-xc++-system-header --precompile" }, header, std::string { "-o" },
+                    output_path.string() };
+                std::array outputs { output_path };
+                std::array<fs::path, 0> inputs {};
+
+                if (!execute_incremental_command(
+                        context, context.cpp_c, args, outputs, inputs, std::string { "header unit <" } + header + ">")) {
                     return false;
                 }
             } else if (context.compiler == Compiler::MSVC) {
@@ -1299,18 +1852,21 @@ auto build_command(Context& context, fs::path dir) -> bool {
                     fs::create_directories(ifc_path.parent_path());
                 }
 
-                if (!execute_command(context, context.cpp_c,
-                        std::array { context.cpp_standard, context.cpp_flags, std::string { "/c" },
-                            std::string { "/exportHeader" }, std::string { "/headerName:angle" }, header,
-                            std::string { "/ifcOutput" }, ifc_path.string(),
-                            std::string { "/Fo" } + obj_path.string() })) {
+                std::array args { context.cpp_standard, context.cpp_flags, std::string { "/c" },
+                    std::string { "/exportHeader" }, std::string { "/headerName:angle" }, header,
+                    std::string { "/ifcOutput" }, ifc_path.string(), std::string { "/Fo" } + obj_path.string() };
+                std::array outputs { ifc_path, obj_path };
+                std::array<fs::path, 0> inputs {};
+
+                if (!execute_incremental_command(
+                        context, context.cpp_c, args, outputs, inputs, std::string { "header unit <" } + header + ">")) {
                     return false;
                 }
             }
         }
     }
 
-    for (std::size_t unit_index = 0; unit_index < context.compile_units.size(); ++unit_index) {
+    auto compile_unit_at = [&](std::size_t unit_index) -> bool {
         const auto& unit = context.compile_units[unit_index];
         fs::path entry_path = unit.file_path;
         auto unit_object_path = object_path(context, unit.file_path);
@@ -1368,7 +1924,9 @@ auto build_command(Context& context, fs::path dir) -> bool {
                 args.push_back(path_arg(unit_object_path));
             }
 
-            if (!execute_command(context, context.cpp_c, args)) {
+            auto inputs = compile_unit_inputs(context, unit, unit_index);
+            std::vector<fs::path> outputs { unit_object_path };
+            if (!execute_incremental_command(context, context.cpp_c, args, outputs, inputs, unit.file_name)) {
                 return false;
             }
         } else {
@@ -1417,7 +1975,10 @@ auto build_command(Context& context, fs::path dir) -> bool {
                 args.push_back(std::string { "-o" });
                 args.push_back(clang_module_pcm_path(unit.module_name).generic_string());
 
-                if (!execute_command(context, context.cpp_c, args)) {
+                auto inputs = compile_unit_inputs(context, unit, unit_index);
+                std::vector<fs::path> outputs { clang_module_pcm_path(unit.module_name) };
+                if (!execute_incremental_command(context, context.cpp_c, args, outputs, inputs,
+                        unit.file_name + " module")) {
                     return false;
                 }
 
@@ -1434,11 +1995,15 @@ auto build_command(Context& context, fs::path dir) -> bool {
                 object_args.push_back(std::string { "-o" });
                 object_args.push_back(path_arg(unit_object_path));
 
-                if (!execute_command(context, context.cpp_c, object_args)) {
+                std::vector<fs::path> object_inputs = compile_unit_inputs(context, unit, unit_index);
+                object_inputs.push_back(clang_module_pcm_path(unit.module_name));
+                std::vector<fs::path> object_outputs { unit_object_path };
+                if (!execute_incremental_command(context, context.cpp_c, object_args, object_outputs, object_inputs,
+                        unit.file_name + " object")) {
                     return false;
                 }
 
-                continue;
+                return true;
             } else {
                 args.push_back(std::string { "-xc++" });
             }
@@ -1450,31 +2015,94 @@ auto build_command(Context& context, fs::path dir) -> bool {
                 args.push_back(path_arg(unit_object_path));
             }
 
-            if (!execute_command(context, context.cpp_c, args)) {
+            auto inputs = compile_unit_inputs(context, unit, unit_index);
+            auto outputs = compile_unit_outputs(context, unit, unit_object_path);
+            if (!execute_incremental_command(context, context.cpp_c, args, outputs, inputs, unit.file_name)) {
                 return false;
             }
+        }
+        return true;
+    };
+
+    if (context.jobs <= 1 || context.dry_run) {
+        for (std::size_t unit_index = 0; unit_index < context.compile_units.size(); ++unit_index) {
+            if (!compile_unit_at(unit_index)) {
+                return false;
+            }
+        }
+    } else {
+        std::vector<std::size_t> parallel_units;
+        parallel_units.reserve(context.compile_units.size());
+
+        for (std::size_t unit_index = 0; unit_index < context.compile_units.size(); ++unit_index) {
+            if (context.compile_units[unit_index].is_importable_module_unit()) {
+                if (!compile_unit_at(unit_index)) {
+                    return false;
+                }
+            } else {
+                parallel_units.push_back(unit_index);
+            }
+        }
+
+        std::vector<std::future<bool>> pending;
+        pending.reserve(std::min(context.jobs, parallel_units.size()));
+
+        auto wait_for_oldest_job = [&]() -> bool {
+            auto result = pending.front().get();
+            pending.erase(std::begin(pending));
+            return result;
+        };
+
+        bool success = true;
+        for (const auto unit_index : parallel_units) {
+            if (!success) {
+                break;
+            }
+
+            pending.push_back(std::async(std::launch::async, compile_unit_at, unit_index));
+            if (pending.size() >= context.jobs && !wait_for_oldest_job()) {
+                success = false;
+            }
+        }
+
+        while (!pending.empty()) {
+            if (!wait_for_oldest_job()) {
+                success = false;
+            }
+        }
+
+        if (!success) {
+            return false;
         }
     }
 
     // link
     std::vector<std::string> link_entries;
+    std::vector<fs::path> link_input_paths;
     for (const auto& unit : context.compile_units) {
-        link_entries.push_back(object_path(context, unit.file_path).string());
+        auto path = object_path(context, unit.file_path);
+        link_entries.push_back(path.string());
+        link_input_paths.push_back(path);
     }
 
     if (context.compiler == Compiler::MSVC) {
         for (const auto& header : context.import_sys_headers) {
-            link_entries.push_back(msvc_header_object_path(header).string());
+            auto path = msvc_header_object_path(header);
+            link_entries.push_back(path.string());
+            link_input_paths.push_back(path);
         }
 
         for (const auto& module_name : context.import_std_modules) {
-            link_entries.push_back(std_module_object_path(module_name).string());
+            auto path = std_module_object_path(module_name);
+            link_entries.push_back(path.string());
+            link_input_paths.push_back(path);
         }
     }
 
     if (context.target != Target::Lib) {
         for (const auto& dependency_link_input : context.dependency_link_inputs) {
             link_entries.push_back(path_arg(dependency_link_input));
+            link_input_paths.push_back(dependency_link_input);
         }
     }
 
@@ -1525,11 +2153,12 @@ auto build_command(Context& context, fs::path dir) -> bool {
         }
     }
 
-    if (!execute_command(context, link_command, link_args)) {
+    auto outputs = link_outputs(context);
+    if (!execute_incremental_command(context, link_command, link_args, outputs, link_input_paths, context.output_name)) {
         return false;
     }
 
-    return true;
+    return save_build_state(context);
 }
 
 static bool is_file_executable(std::string_view filename) {
@@ -1664,8 +2293,18 @@ auto run_command(Context& context, fs::path dir) -> bool {
         std::fflush(stdout);
     }
 
-    auto app_command = path_arg(app_file);
-    return std::system(std::data(app_command)) == 0;
+    auto display_command = quote_arg(app_file.string());
+    if (context.verbose) {
+        std::println("command: {}", display_command);
+    }
+
+    const int status = spawn_process(app_file.string(), {});
+    if (status != 0) {
+        std::println("Error: command failed with status {}", status);
+        return false;
+    }
+
+    return true;
 }
 
 auto clean_command(Context& context, fs::path dir) -> bool {
@@ -1790,6 +2429,19 @@ static auto check_option(std::span<const std::string_view> opts, std::string_vie
     }
 
     return false;
+}
+
+auto parse_jobs_count(std::string_view value, std::size_t& jobs) -> bool {
+    uint64_t parsed = 0;
+    const auto* begin = value.data();
+    const auto* end = value.data() + value.size();
+    auto [ptr, ec] = std::from_chars(begin, end, parsed);
+    if (ec != std::errc {} || ptr != end || parsed == 0) {
+        return false;
+    }
+
+    jobs = static_cast<std::size_t>(parsed);
+    return true;
 }
 
 auto init_gcc_compiler(Context& context) -> void {
@@ -2043,6 +2695,19 @@ auto apply_build_options(Context& context, std::span<const std::string_view> opt
 
             context.output_name = opts[++idx];
             context.output_name_configured = true;
+        } else if (opt == JobsOptTag || opt == LongJobsOptTag) {
+            if (idx + 1 >= opts.size() || is_option_argument(opts[idx + 1])) {
+                std::println("Error: Invalid option '{}' in {}, option didn't have parameter", opt, source);
+                return false;
+            }
+
+            std::size_t jobs = 1;
+            const auto value = opts[++idx];
+            if (!parse_jobs_count(value, jobs)) {
+                std::println("Error: Invalid jobs count '{}' in {}", value, source);
+                return false;
+            }
+            context.jobs = jobs;
         }
     }
 
@@ -2268,6 +2933,28 @@ auto init_context(Context& context, std::string_view command, const InitConfigur
 
                         context.output_name = output_name;
                         context.output_name_configured = true;
+                    } else {
+                        std::println("Error: Invalid option '{}' for {} command, option didn't have {}", opt, command,
+                            "parameter");
+                        return false;
+                    }
+                } else if (opt == JobsOptTag || opt == LongJobsOptTag) {
+                    if (idx + 1 < conf.argc) {
+                        idx++;
+                        std::string_view jobs_value { conf.argv[idx] };
+
+                        if (is_option_argument(jobs_value)) {
+                            std::println("Error: Invalid option '{}' for {} command, option didn't have {}", opt,
+                                command, "parameter");
+                            return false;
+                        }
+
+                        std::size_t jobs = 1;
+                        if (!parse_jobs_count(jobs_value, jobs)) {
+                            std::println("Error: Invalid jobs count '{}' for {} command", jobs_value, command);
+                            return false;
+                        }
+                        context.jobs = jobs;
                     } else {
                         std::println("Error: Invalid option '{}' for {} command, option didn't have {}", opt, command,
                             "parameter");

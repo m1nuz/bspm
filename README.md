@@ -107,6 +107,12 @@ Print build commands without running them
 bspm build <dir> --dry-run
 ```
 
+Compile independent source files in parallel
+```console
+bspm build <dir> -j 4
+bspm build <dir> --jobs 4
+```
+
 Build current directory
 ```console
 bspm build

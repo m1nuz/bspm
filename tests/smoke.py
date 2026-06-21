@@ -216,8 +216,15 @@ def assert_dry_run_plans(bspm: Path, workspace: Path, toolchain: Toolchain) -> N
 def assert_simple_binary(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:
     fixture = copy_fixture("simple-bin", workspace)
     run(build_command(bspm, toolchain, fixture))
+    incremental_result = run(build_command(bspm, toolchain, fixture, "-v"))
+    expect("up to date:" in incremental_result.stdout, "second simple build should skip up-to-date steps")
     result = run([bspm, "run", fixture])
     expect(result.stdout.strip() == "simple-bin: ok", "simple binary should run")
+
+    spaced_fixture = copy_fixture("simple-bin", workspace, suffix="-with spaces")
+    run(build_command(bspm, toolchain, spaced_fixture))
+    spaced_result = run([bspm, "run", spaced_fixture])
+    expect(spaced_result.stdout.strip() == "simple-bin: ok", "simple binary should build and run from a path with spaces")
 
 
 def assert_nested_module_binary(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:
@@ -225,6 +232,13 @@ def assert_nested_module_binary(bspm: Path, workspace: Path, toolchain: Toolchai
     run(build_command(bspm, toolchain, fixture))
     result = run([bspm, "run", fixture])
     expect(result.stdout.strip() == "nested-module: 42", "nested module binary should run")
+
+
+def assert_parallel_build(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:
+    fixture = copy_fixture("multi-source", workspace)
+    run(build_command(bspm, toolchain, fixture, "-j", "2"))
+    result = run([bspm, "run", fixture])
+    expect(result.stdout.strip() == "multi-source: 7", "parallel multi-source binary should run")
 
 
 def assert_library_outputs(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:
@@ -303,6 +317,7 @@ def main() -> int:
         if level == "full":
             assert_simple_binary(bspm, workspace, toolchain)
             assert_nested_module_binary(bspm, workspace, toolchain)
+            assert_parallel_build(bspm, workspace, toolchain)
             assert_library_outputs(bspm, workspace, toolchain)
             assert_project_build_run_and_clean(bspm, workspace, toolchain)
 
