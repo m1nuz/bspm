@@ -204,6 +204,21 @@ def assert_dry_run_plans(bspm: Path, workspace: Path, toolchain: Toolchain) -> N
     simple_result = run(build_command(bspm, toolchain, simple, "--dry-run"))
     expect("command:" in simple_result.stdout, "simple build dry-run should print commands")
 
+    flag_result = run(
+        build_command(
+            bspm,
+            toolchain,
+            simple,
+            "--dry-run",
+            "--cxxflag",
+            "-DBSPM_DRY_RUN=1",
+            "--ldflag",
+            "-Wl,--dry-run-flag",
+        )
+    )
+    expect("-DBSPM_DRY_RUN=1" in flag_result.stdout, "dry-run should include user compiler flags")
+    expect("-Wl,--dry-run-flag" in flag_result.stdout, "dry-run should include user linker flags")
+
     nested = copy_fixture("nested-module", workspace, suffix="-dry-run")
     nested_result = run(build_command(bspm, toolchain, nested, "--dry-run"))
     expect("command:" in nested_result.stdout, "module build dry-run should print commands")
@@ -239,6 +254,29 @@ def assert_parallel_build(bspm: Path, workspace: Path, toolchain: Toolchain) -> 
     run(build_command(bspm, toolchain, fixture, "-j", "2"))
     result = run([bspm, "run", fixture])
     expect(result.stdout.strip() == "multi-source: 7", "parallel multi-source binary should run")
+
+
+def assert_user_build_options(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:
+    fixture = copy_fixture("user-options", workspace)
+    run(
+        build_command(
+            bspm,
+            toolchain,
+            fixture,
+            "--source",
+            ".",
+            "--exclude",
+            "ignored",
+            "--include",
+            "include",
+            "--define",
+            "BSPM_DEFINE_VALUE=12",
+            "--cxxflag",
+            "-DBSPM_CXXFLAG_VALUE=30",
+        )
+    )
+    result = run([bspm, "run", fixture])
+    expect(result.stdout.strip() == "user-options: 42", "user build options should affect compile and discovery")
 
 
 def assert_library_outputs(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:
@@ -318,6 +356,7 @@ def main() -> int:
             assert_simple_binary(bspm, workspace, toolchain)
             assert_nested_module_binary(bspm, workspace, toolchain)
             assert_parallel_build(bspm, workspace, toolchain)
+            assert_user_build_options(bspm, workspace, toolchain)
             assert_library_outputs(bspm, workspace, toolchain)
             assert_project_build_run_and_clean(bspm, workspace, toolchain)
 

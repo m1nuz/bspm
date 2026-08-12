@@ -113,6 +113,13 @@ bspm build <dir> -j 4
 bspm build <dir> --jobs 4
 ```
 
+Add compile, link, definition, include, and discovery options
+```console
+bspm build <dir> --include include --define APP_DEBUG=1
+bspm build <dir> --cxxflag -Wall --ldflag -pthread
+bspm build <dir> --source src --exclude src/generated
+```
+
 Build current directory
 ```console
 bspm build
@@ -133,6 +140,7 @@ ordering:
 ```text
 project demo
 default app
+common --include include --define DEMO_TRACE=1
 
 target math libs/math --lib -o math
 target greeting libs/greeting --shared -o greeting
@@ -159,9 +167,15 @@ bspm build examples/project-config --project
 `bspm.build` uses a small shell-like syntax:
 - `project <name>` names the project.
 - `default <target>` chooses what bare `build`, `run`, and `clean` mean.
+- `common [options]` applies shared build options to every target before each
+  target's own options.
 - `target <name> <path> [options]` defines a folder target.
 - Target options currently accept the same build flags as the CLI plus repeated
   `--depends <target>` entries.
+- Repeated `--cxxflag`, `--ldflag`, `--define`, `--include`, `--source`, and
+  `--exclude` entries are allowed. Values that contain spaces can be quoted.
+- `--source` restricts discovery to one file or directory relative to the target
+  root, and `--exclude` removes matching files or directories from discovery.
 - `--depends` builds dependencies first, exposes their module artifacts to the
   consumer target, and adds library outputs to the consumer link step.
 - `#` starts a comment, and quoted paths such as `"tools/code gen"` are allowed.

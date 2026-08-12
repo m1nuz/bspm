@@ -1,5 +1,6 @@
 project smoke
 default app
+common --source . --exclude ignored --include include --define PROJECT_CONFIG_OFFSET=0 --cxxflag -DPROJECT_CONFIG_CXXFLAG=1
 
 target math libs/math --lib -o math
 target greeting libs/greeting --shared -o greeting

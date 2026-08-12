@@ -89,6 +89,12 @@ constexpr std::string_view DependsOptTag { "--depends" };
 constexpr std::string_view ProjectOptTag { "--project" };
 constexpr std::string_view JobsOptTag { "-j" };
 constexpr std::string_view LongJobsOptTag { "--jobs" };
+constexpr std::string_view CxxFlagOptTag { "--cxxflag" };
+constexpr std::string_view LdFlagOptTag { "--ldflag" };
+constexpr std::string_view DefineOptTag { "--define" };
+constexpr std::string_view IncludeOptTag { "--include" };
+constexpr std::string_view SourceOptTag { "--source" };
+constexpr std::string_view ExcludeOptTag { "--exclude" };
 
 std::array BuildOpts {
     BinaryOptTag,
@@ -104,6 +110,12 @@ std::array BuildOpts {
     ProjectOptTag,
     JobsOptTag,
     LongJobsOptTag,
+    CxxFlagOptTag,
+    LdFlagOptTag,
+    DefineOptTag,
+    IncludeOptTag,
+    SourceOptTag,
+    ExcludeOptTag,
 };
 
 std::array InitOpts {
@@ -193,6 +205,12 @@ struct Context {
     fs::path source_dir;
     fs::path build_dir;
     fs::path msvc_dev_cmd;
+    std::vector<std::string> user_cxx_flags;
+    std::vector<std::string> user_ld_flags;
+    std::vector<std::string> defines;
+    std::vector<fs::path> include_dirs;
+    std::vector<fs::path> source_filters;
+    std::vector<fs::path> exclude_filters;
 
     std::vector<std::string> import_sys_headers;
     std::vector<std::string> import_std_modules;
@@ -230,6 +248,7 @@ struct ProjectConfig {
     std::string name;
     std::string default_target;
     fs::path root;
+    std::vector<std::string> common_build_options;
     std::vector<TargetConfig> targets;
 };
 
@@ -245,6 +264,7 @@ struct BuiltTargetArtifacts {
 };
 
 auto configure_target_paths(Context& context, const fs::path& source_dir) -> void;
+auto build_option_views(const std::vector<std::string>& options) -> std::vector<std::string_view>;
 
 auto quote_arg(std::string_view arg) -> std::string {
     const bool needs_quotes = arg.find_first_of(" \t\"") != std::string_view::npos;
@@ -830,6 +850,12 @@ auto help_command(Context& context, std::string_view command) -> void {
         std::println("\t--dry-run\t\tPrint compile/link commands without running them");
         std::println("\t--project\t\tTreat [dir] as a project root containing bspm.build");
         std::println("\t-j, --jobs <count>\tCompile independent source files in parallel");
+        std::println("\t--cxxflag <flag>\tAdd a compiler flag");
+        std::println("\t--ldflag <flag>\t\tAdd a linker flag");
+        std::println("\t--define <name[=value]>\tAdd a preprocessor definition");
+        std::println("\t--include <dir>\t\tAdd an include directory");
+        std::println("\t--source <path>\t\tRestrict source discovery to a file or directory");
+        std::println("\t--exclude <path>\tExclude a file or directory from source discovery");
         std::println("\t-v\t\t\tPrint commands while building");
         return;
     }
@@ -1566,15 +1592,94 @@ auto is_ignored_source_directory(const fs::path& path) -> bool {
     return name == "build" || name == "gcm.cache" || name == ".cache" || name == ".git" || name.front() == '.';
 }
 
-auto collect_source_entries(const Context& context) -> std::vector<fs::directory_entry> {
-    std::vector<fs::directory_entry> entries;
-    std::error_code ec;
+auto is_source_file(const fs::path& path) -> bool {
+    const auto extension = path.extension().string();
+    return extension == ".cpp" || extension == ".cppm";
+}
 
-    for (fs::recursive_directory_iterator it { context.source_dir, fs::directory_options::skip_permission_denied, ec },
-        end;
+auto source_filter_root(const Context& context, const fs::path& filter) -> fs::path {
+    return filter.is_absolute() ? filter : context.source_dir / filter;
+}
+
+auto target_relative_path(const Context& context, const fs::path& path) -> fs::path {
+    return path.is_absolute() ? path : context.source_dir / path;
+}
+
+auto relative_filter_path(const Context& context, const fs::path& path) -> fs::path {
+    const auto absolute_path = path.is_absolute() ? path : context.source_dir / path;
+    std::error_code ec;
+    auto relative_path = fs::relative(absolute_path, context.source_dir, ec);
+    return ec ? path.lexically_normal() : relative_path.lexically_normal();
+}
+
+auto path_is_within_or_equal(const fs::path& path, const fs::path& parent) -> bool {
+    auto path_string = path.lexically_normal().generic_string();
+    auto parent_string = parent.lexically_normal().generic_string();
+    if (parent_string == ".") {
+        return true;
+    }
+    if (path_string == parent_string) {
+        return true;
+    }
+    if (!parent_string.ends_with('/')) {
+        parent_string.push_back('/');
+    }
+    return path_string.starts_with(parent_string);
+}
+
+auto is_excluded_source_path(const Context& context, const fs::path& path) -> bool {
+    if (context.exclude_filters.empty()) {
+        return false;
+    }
+
+    const auto relative_path = relative_filter_path(context, path);
+    for (const auto& filter : context.exclude_filters) {
+        if (path_is_within_or_equal(relative_path, relative_filter_path(context, filter))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto append_source_entry(const Context& context, const fs::directory_entry& entry,
+    std::vector<fs::directory_entry>& entries) -> void {
+    if (!is_source_file(entry.path()) || is_excluded_source_path(context, entry.path())) {
+        return;
+    }
+
+    if (context.verbose) {
+        std::error_code relative_ec;
+        auto relative_path = fs::relative(entry.path(), context.source_dir, relative_ec);
+        std::println("entry: {}", relative_ec ? entry.path().filename().string() : relative_path.generic_string());
+    }
+
+    if (std::none_of(std::begin(entries), std::end(entries),
+            [&](const auto& existing) { return existing.path() == entry.path(); })) {
+        entries.push_back(entry);
+    }
+}
+
+auto append_source_entries_from_root(
+    const Context& context, const fs::path& root, std::vector<fs::directory_entry>& entries, std::error_code& ec)
+    -> bool {
+    if (is_excluded_source_path(context, root)) {
+        return true;
+    }
+
+    if (fs::is_regular_file(root, ec)) {
+        append_source_entry(context, fs::directory_entry { root }, entries);
+        return !ec;
+    }
+
+    if (!fs::is_directory(root, ec)) {
+        std::println("Error: source path '{}' is not a file or directory", root.string());
+        return false;
+    }
+
+    for (fs::recursive_directory_iterator it { root, fs::directory_options::skip_permission_denied, ec }, end;
         !ec && it != end; it.increment(ec)) {
         if (it->is_directory(ec)) {
-            if (is_ignored_source_directory(it->path())) {
+            if (is_ignored_source_directory(it->path()) || is_excluded_source_path(context, it->path())) {
                 it.disable_recursion_pending();
             }
             continue;
@@ -1584,18 +1689,24 @@ auto collect_source_entries(const Context& context) -> std::vector<fs::directory
             continue;
         }
 
-        const auto extension = it->path().extension().string();
-        if (extension != ".cpp" && extension != ".cppm") {
-            continue;
-        }
+        append_source_entry(context, *it, entries);
+    }
 
-        if (context.verbose) {
-            std::error_code relative_ec;
-            auto relative_path = fs::relative(it->path(), context.source_dir, relative_ec);
-            std::println("entry: {}", relative_ec ? it->path().filename().string() : relative_path.generic_string());
-        }
+    return !ec;
+}
 
-        entries.push_back(*it);
+auto collect_source_entries(const Context& context) -> std::vector<fs::directory_entry> {
+    std::vector<fs::directory_entry> entries;
+    std::error_code ec;
+
+    if (context.source_filters.empty()) {
+        append_source_entries_from_root(context, context.source_dir, entries, ec);
+    } else {
+        for (const auto& filter : context.source_filters) {
+            if (!append_source_entries_from_root(context, source_filter_root(context, filter), entries, ec)) {
+                break;
+            }
+        }
     }
 
     if (ec) {
@@ -1745,6 +1856,251 @@ auto link_outputs(const Context& context) -> std::vector<fs::path> {
     return outputs;
 }
 
+auto append_clang_unit_import_args(
+    std::vector<std::string>& args, const Context& context, const CompileUnit& unit, std::size_t unit_index) -> void {
+    for (const auto& imported_module : unit.imports) {
+        std::string module_file;
+        std::format_to(std::back_inserter(module_file), "-fmodule-file=\"{}.pcm\"",
+            (fs::path { ".cache" } / imported_module).string());
+        args.push_back(module_file);
+    }
+
+    for (const auto& imported_std_module : ordered_std_module_references(unit.std_module_imports)) {
+        args.push_back(std::string { "-fmodule-file=" } + imported_std_module + "="
+            + std_module_pcm_path(imported_std_module).generic_string());
+    }
+
+    append_dependency_clang_module_references(args, context);
+    append_previous_clang_module_references(args, context, unit_index);
+}
+
+auto append_non_msvc_source_compile_args(std::vector<std::string>& args, const CompileUnit& unit,
+    const fs::path& unit_object_path, std::string_view extension) -> void {
+    if (extension == ".cppm") {
+        args.push_back(std::string { "-xc++" });
+    }
+
+    args.push_back(std::string { "-c" });
+    args.push_back(path_arg(unit.file_path));
+    args.push_back(std::string { "-o" });
+    args.push_back(path_arg(unit_object_path));
+}
+
+auto append_user_compile_args(std::vector<std::string>& args, const Context& context) -> void {
+    args.insert(std::end(args), std::begin(context.user_cxx_flags), std::end(context.user_cxx_flags));
+
+    for (const auto& define : context.defines) {
+        if (context.compiler == Compiler::MSVC) {
+            args.push_back(std::string { "/D" } + define);
+        } else {
+            args.push_back(std::string { "-D" } + define);
+        }
+    }
+
+    for (const auto& include_dir : context.include_dirs) {
+        if (context.compiler == Compiler::MSVC) {
+            args.push_back(std::string { "/I" });
+        } else {
+            args.push_back(std::string { "-I" });
+        }
+        args.push_back(path_arg(target_relative_path(context, include_dir)));
+    }
+}
+
+auto append_user_link_args(std::vector<std::string>& args, const Context& context) -> void {
+    args.insert(std::end(args), std::begin(context.user_ld_flags), std::end(context.user_ld_flags));
+}
+
+auto compile_object_only_unit(Context& context, std::size_t unit_index, const CompileUnit& unit,
+    const fs::path& unit_object_path, std::string_view extension) -> bool {
+    std::vector<std::string> args {
+        context.cpp_standard,
+        context.cpp_flags,
+    };
+    append_user_compile_args(args, context);
+
+    if (context.compiler == Compiler::MSVC) {
+        args.push_back(std::string { "/c" });
+        args.push_back(std::string { "/TP" });
+
+        append_msvc_import_args(args, context, unit);
+
+        args.push_back(std::string { "/Fo" } + unit_object_path.string());
+        args.push_back(path_arg(unit.file_path));
+    } else if (context.compiler == Compiler::Clang) {
+        args.push_back("-Wno-experimental-header-units");
+        append_clang_unit_import_args(args, context, unit, unit_index);
+    }
+
+    if (context.compiler != Compiler::MSVC) {
+        append_non_msvc_source_compile_args(args, unit, unit_object_path, extension);
+    }
+
+    auto inputs = compile_unit_inputs(context, unit, unit_index);
+    std::vector<fs::path> outputs { unit_object_path };
+    return execute_incremental_command(context, context.cpp_c, args, outputs, inputs, unit.file_name);
+}
+
+auto compile_clang_importable_unit(
+    Context& context, std::size_t unit_index, const CompileUnit& unit, const fs::path& unit_object_path) -> bool {
+    std::vector<std::string> module_args {
+        context.cpp_standard,
+        context.cpp_flags,
+        std::string { "-xc++" },
+        std::string { "-xc++-module" },
+        std::string { "--precompile" },
+        std::string { "-Wno-experimental-header-units" },
+    };
+    append_user_compile_args(module_args, context);
+
+    append_clang_unit_import_args(module_args, context, unit, unit_index);
+
+    module_args.push_back(path_arg(unit.file_path));
+    module_args.push_back(std::string { "-o" });
+    module_args.push_back(clang_module_pcm_path(unit.module_name).generic_string());
+
+    auto inputs = compile_unit_inputs(context, unit, unit_index);
+    std::vector<fs::path> outputs { clang_module_pcm_path(unit.module_name) };
+    if (!execute_incremental_command(context, context.cpp_c, module_args, outputs, inputs, unit.file_name + " module")) {
+        return false;
+    }
+
+    std::vector<std::string> object_args {
+        context.cpp_standard,
+        context.cpp_flags,
+    };
+    append_user_compile_args(object_args, context);
+
+    append_dependency_clang_module_references(object_args, context);
+    append_previous_clang_module_references(object_args, context, unit_index);
+
+    object_args.push_back(std::string { "-c" });
+    object_args.push_back(clang_module_pcm_path(unit.module_name).generic_string());
+    object_args.push_back(std::string { "-o" });
+    object_args.push_back(path_arg(unit_object_path));
+
+    std::vector<fs::path> object_inputs = compile_unit_inputs(context, unit, unit_index);
+    object_inputs.push_back(clang_module_pcm_path(unit.module_name));
+    std::vector<fs::path> object_outputs { unit_object_path };
+    return execute_incremental_command(
+        context, context.cpp_c, object_args, object_outputs, object_inputs, unit.file_name + " object");
+}
+
+auto compile_importable_unit(Context& context, std::size_t unit_index, const CompileUnit& unit,
+    const fs::path& unit_object_path) -> bool {
+    if (context.compiler == Compiler::Clang) {
+        return compile_clang_importable_unit(context, unit_index, unit, unit_object_path);
+    }
+
+    std::vector<std::string> args {
+        context.cpp_standard,
+        context.cpp_flags,
+    };
+    append_user_compile_args(args, context);
+
+    if (context.compiler == Compiler::MSVC) {
+        args.push_back(std::string { "/c" });
+        args.push_back(std::string { "/TP" });
+        if (unit.module_kind == ModuleUnitKind::InternalPartition) {
+            args.push_back(std::string { "/internalPartition" });
+        } else {
+            args.push_back(std::string { "/interface" });
+        }
+
+        append_msvc_import_args(args, context, unit);
+
+        args.push_back(std::string { "/ifcOutput" });
+        args.push_back(msvc_module_ifc_path(unit.module_name).string());
+        args.push_back(std::string { "/Fo" } + unit_object_path.string());
+        args.push_back(path_arg(unit.file_path));
+    } else {
+        args.push_back(std::string { "-xc++" });
+        args.push_back(std::string { "-c" });
+        args.push_back(path_arg(unit.file_path));
+        args.push_back(std::string { "-o" });
+        args.push_back(path_arg(unit_object_path));
+    }
+
+    auto inputs = compile_unit_inputs(context, unit, unit_index);
+    auto outputs = compile_unit_outputs(context, unit, unit_object_path);
+    return execute_incremental_command(context, context.cpp_c, args, outputs, inputs, unit.file_name);
+}
+
+auto compile_unit(Context& context, std::size_t unit_index) -> bool {
+    const auto& unit = context.compile_units[unit_index];
+    const auto extension = unit.file_path.extension().string();
+    auto unit_object_path = object_path(context, unit.file_path);
+    if (!ensure_parent_directory(unit_object_path)) {
+        return false;
+    }
+
+    if (extension == ".cppm" && !unit.declares_module()) {
+        std::println("Error: '{}' uses the .cppm extension but does not declare a module unit", unit.file_name);
+        return false;
+    }
+
+    if (unit.is_importable_module_unit()) {
+        return compile_importable_unit(context, unit_index, unit, unit_object_path);
+    }
+
+    return compile_object_only_unit(context, unit_index, unit, unit_object_path, extension);
+}
+
+auto compile_units(Context& context) -> bool {
+    if (context.jobs <= 1 || context.dry_run) {
+        for (std::size_t unit_index = 0; unit_index < context.compile_units.size(); ++unit_index) {
+            if (!compile_unit(context, unit_index)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::vector<std::size_t> parallel_units;
+    parallel_units.reserve(context.compile_units.size());
+
+    for (std::size_t unit_index = 0; unit_index < context.compile_units.size(); ++unit_index) {
+        if (context.compile_units[unit_index].is_importable_module_unit()) {
+            if (!compile_unit(context, unit_index)) {
+                return false;
+            }
+        } else {
+            parallel_units.push_back(unit_index);
+        }
+    }
+
+    std::vector<std::future<bool>> pending;
+    pending.reserve(std::min(context.jobs, parallel_units.size()));
+
+    auto wait_for_oldest_job = [&]() -> bool {
+        auto result = pending.front().get();
+        pending.erase(std::begin(pending));
+        return result;
+    };
+
+    bool success = true;
+    for (const auto unit_index : parallel_units) {
+        if (!success) {
+            break;
+        }
+
+        pending.push_back(std::async(std::launch::async, [&context, unit_index] {
+            return compile_unit(context, unit_index);
+        }));
+        if (pending.size() >= context.jobs && !wait_for_oldest_job()) {
+            success = false;
+        }
+    }
+
+    while (!pending.empty()) {
+        if (!wait_for_oldest_job()) {
+            success = false;
+        }
+    }
+
+    return success;
+}
+
 auto build_command(Context& context, fs::path dir) -> bool {
     dir = !dir.empty() ? dir : ".";
 
@@ -1822,9 +2178,16 @@ auto build_command(Context& context, fs::path dir) -> bool {
         for (const auto& header : context.import_sys_headers) {
 
             if (context.compiler == Compiler::GCC) {
-                if (!execute_command(context, context.cpp_c,
-                        std::array { context.cpp_standard, context.cpp_flags, std::string { "-xc++-system-header" },
-                            std::string { "-c" }, header })) {
+                std::vector<std::string> args {
+                    context.cpp_standard,
+                    context.cpp_flags,
+                };
+                append_user_compile_args(args, context);
+                args.push_back(std::string { "-xc++-system-header" });
+                args.push_back(std::string { "-c" });
+                args.push_back(header);
+
+                if (!execute_command(context, context.cpp_c, args)) {
                     return false;
                 }
             } else if (context.compiler == Compiler::Clang) {
@@ -1834,9 +2197,15 @@ auto build_command(Context& context, fs::path dir) -> bool {
                     return false;
                 }
 
-                std::array args { context.cpp_standard, context.cpp_flags,
-                    std::string { "-xc++-system-header --precompile" }, header, std::string { "-o" },
-                    output_path.string() };
+                std::vector<std::string> args {
+                    context.cpp_standard,
+                    context.cpp_flags,
+                };
+                append_user_compile_args(args, context);
+                args.push_back(std::string { "-xc++-system-header --precompile" });
+                args.push_back(header);
+                args.push_back(std::string { "-o" });
+                args.push_back(output_path.string());
                 std::array outputs { output_path };
                 std::array<fs::path, 0> inputs {};
 
@@ -1852,9 +2221,18 @@ auto build_command(Context& context, fs::path dir) -> bool {
                     fs::create_directories(ifc_path.parent_path());
                 }
 
-                std::array args { context.cpp_standard, context.cpp_flags, std::string { "/c" },
-                    std::string { "/exportHeader" }, std::string { "/headerName:angle" }, header,
-                    std::string { "/ifcOutput" }, ifc_path.string(), std::string { "/Fo" } + obj_path.string() };
+                std::vector<std::string> args {
+                    context.cpp_standard,
+                    context.cpp_flags,
+                };
+                append_user_compile_args(args, context);
+                args.push_back(std::string { "/c" });
+                args.push_back(std::string { "/exportHeader" });
+                args.push_back(std::string { "/headerName:angle" });
+                args.push_back(header);
+                args.push_back(std::string { "/ifcOutput" });
+                args.push_back(ifc_path.string());
+                args.push_back(std::string { "/Fo" } + obj_path.string());
                 std::array outputs { ifc_path, obj_path };
                 std::array<fs::path, 0> inputs {};
 
@@ -1866,214 +2244,8 @@ auto build_command(Context& context, fs::path dir) -> bool {
         }
     }
 
-    auto compile_unit_at = [&](std::size_t unit_index) -> bool {
-        const auto& unit = context.compile_units[unit_index];
-        fs::path entry_path = unit.file_path;
-        auto unit_object_path = object_path(context, unit.file_path);
-        if (!ensure_parent_directory(unit_object_path)) {
-            return false;
-        }
-
-        auto extension = entry_path.extension().string();
-        if (extension == ".cppm" && !unit.declares_module()) {
-            std::println("Error: '{}' uses the .cppm extension but does not declare a module unit", unit.file_name);
-            return false;
-        }
-
-        if (!unit.is_importable_module_unit()) {
-            std::vector<std::string> args;
-
-            args.push_back(context.cpp_standard);
-            args.push_back(context.cpp_flags);
-
-            if (context.compiler == Compiler::MSVC) {
-                args.push_back(std::string { "/c" });
-                args.push_back(std::string { "/TP" });
-
-                append_msvc_import_args(args, context, unit);
-
-                args.push_back(std::string { "/Fo" } + unit_object_path.string());
-                args.push_back(path_arg(unit.file_path));
-            } else if (context.compiler == Compiler::Clang) {
-                args.push_back("-Wno-experimental-header-units");
-
-                for (const auto& imported_module : unit.imports) {
-                    std::string module_file;
-                    std::format_to(std::back_inserter(module_file), "-fmodule-file=\"{}.pcm\"",
-                        (fs::path { ".cache" } / imported_module).string());
-                    args.push_back(module_file);
-                }
-
-                for (const auto& imported_std_module : ordered_std_module_references(unit.std_module_imports)) {
-                    args.push_back(std::string { "-fmodule-file=" } + imported_std_module + "="
-                        + std_module_pcm_path(imported_std_module).generic_string());
-                }
-
-                append_dependency_clang_module_references(args, context);
-                append_previous_clang_module_references(args, context, unit_index);
-            }
-
-            if (context.compiler != Compiler::MSVC) {
-                if (extension == ".cppm") {
-                    args.push_back(std::string { "-xc++" });
-                }
-
-                args.push_back(std::string { "-c" });
-                args.push_back(path_arg(unit.file_path));
-                args.push_back(std::string { "-o" });
-                args.push_back(path_arg(unit_object_path));
-            }
-
-            auto inputs = compile_unit_inputs(context, unit, unit_index);
-            std::vector<fs::path> outputs { unit_object_path };
-            if (!execute_incremental_command(context, context.cpp_c, args, outputs, inputs, unit.file_name)) {
-                return false;
-            }
-        } else {
-            std::vector<std::string> args;
-
-            args.push_back(context.cpp_standard);
-            args.push_back(context.cpp_flags);
-
-            if (context.compiler == Compiler::MSVC) {
-                args.push_back(std::string { "/c" });
-                args.push_back(std::string { "/TP" });
-                if (unit.module_kind == ModuleUnitKind::InternalPartition) {
-                    args.push_back(std::string { "/internalPartition" });
-                } else {
-                    args.push_back(std::string { "/interface" });
-                }
-
-                append_msvc_import_args(args, context, unit);
-
-                args.push_back(std::string { "/ifcOutput" });
-                args.push_back(msvc_module_ifc_path(unit.module_name).string());
-                args.push_back(std::string { "/Fo" } + unit_object_path.string());
-                args.push_back(path_arg(unit.file_path));
-            } else if (context.compiler == Compiler::Clang) {
-                args.push_back(std::string { "-xc++" });
-                args.push_back(std::string { "-xc++-module" });
-                args.push_back(std::string { "--precompile" });
-                args.push_back("-Wno-experimental-header-units");
-
-                for (const auto& imported_module : unit.imports) {
-                    std::string module_file;
-                    std::format_to(std::back_inserter(module_file), "-fmodule-file=\"{}.pcm\"",
-                        (fs::path { ".cache" } / imported_module).string());
-                    args.push_back(module_file);
-                }
-
-                for (const auto& imported_std_module : ordered_std_module_references(unit.std_module_imports)) {
-                    args.push_back(std::string { "-fmodule-file=" } + imported_std_module + "="
-                        + std_module_pcm_path(imported_std_module).generic_string());
-                }
-
-                append_dependency_clang_module_references(args, context);
-                append_previous_clang_module_references(args, context, unit_index);
-
-                args.push_back(path_arg(unit.file_path));
-                args.push_back(std::string { "-o" });
-                args.push_back(clang_module_pcm_path(unit.module_name).generic_string());
-
-                auto inputs = compile_unit_inputs(context, unit, unit_index);
-                std::vector<fs::path> outputs { clang_module_pcm_path(unit.module_name) };
-                if (!execute_incremental_command(context, context.cpp_c, args, outputs, inputs,
-                        unit.file_name + " module")) {
-                    return false;
-                }
-
-                std::vector<std::string> object_args {
-                    context.cpp_standard,
-                    context.cpp_flags,
-                };
-
-                append_dependency_clang_module_references(object_args, context);
-                append_previous_clang_module_references(object_args, context, unit_index);
-
-                object_args.push_back(std::string { "-c" });
-                object_args.push_back(clang_module_pcm_path(unit.module_name).generic_string());
-                object_args.push_back(std::string { "-o" });
-                object_args.push_back(path_arg(unit_object_path));
-
-                std::vector<fs::path> object_inputs = compile_unit_inputs(context, unit, unit_index);
-                object_inputs.push_back(clang_module_pcm_path(unit.module_name));
-                std::vector<fs::path> object_outputs { unit_object_path };
-                if (!execute_incremental_command(context, context.cpp_c, object_args, object_outputs, object_inputs,
-                        unit.file_name + " object")) {
-                    return false;
-                }
-
-                return true;
-            } else {
-                args.push_back(std::string { "-xc++" });
-            }
-
-            if (context.compiler != Compiler::MSVC) {
-                args.push_back(std::string { "-c" });
-                args.push_back(path_arg(unit.file_path));
-                args.push_back(std::string { "-o" });
-                args.push_back(path_arg(unit_object_path));
-            }
-
-            auto inputs = compile_unit_inputs(context, unit, unit_index);
-            auto outputs = compile_unit_outputs(context, unit, unit_object_path);
-            if (!execute_incremental_command(context, context.cpp_c, args, outputs, inputs, unit.file_name)) {
-                return false;
-            }
-        }
-        return true;
-    };
-
-    if (context.jobs <= 1 || context.dry_run) {
-        for (std::size_t unit_index = 0; unit_index < context.compile_units.size(); ++unit_index) {
-            if (!compile_unit_at(unit_index)) {
-                return false;
-            }
-        }
-    } else {
-        std::vector<std::size_t> parallel_units;
-        parallel_units.reserve(context.compile_units.size());
-
-        for (std::size_t unit_index = 0; unit_index < context.compile_units.size(); ++unit_index) {
-            if (context.compile_units[unit_index].is_importable_module_unit()) {
-                if (!compile_unit_at(unit_index)) {
-                    return false;
-                }
-            } else {
-                parallel_units.push_back(unit_index);
-            }
-        }
-
-        std::vector<std::future<bool>> pending;
-        pending.reserve(std::min(context.jobs, parallel_units.size()));
-
-        auto wait_for_oldest_job = [&]() -> bool {
-            auto result = pending.front().get();
-            pending.erase(std::begin(pending));
-            return result;
-        };
-
-        bool success = true;
-        for (const auto unit_index : parallel_units) {
-            if (!success) {
-                break;
-            }
-
-            pending.push_back(std::async(std::launch::async, compile_unit_at, unit_index));
-            if (pending.size() >= context.jobs && !wait_for_oldest_job()) {
-                success = false;
-            }
-        }
-
-        while (!pending.empty()) {
-            if (!wait_for_oldest_job()) {
-                success = false;
-            }
-        }
-
-        if (!success) {
-            return false;
-        }
+    if (!compile_units(context)) {
+        return false;
     }
 
     // link
@@ -2144,6 +2316,7 @@ auto build_command(Context& context, fs::path dir) -> bool {
         if (!context.ld_flags.empty()) {
             link_args.push_back(context.ld_flags);
         }
+        append_user_link_args(link_args, context);
 
         if (context.compiler == Compiler::MSVC) {
             link_args.push_back(std::string { "/Fe" } + context.output_name);
@@ -2708,6 +2881,27 @@ auto apply_build_options(Context& context, std::span<const std::string_view> opt
                 return false;
             }
             context.jobs = jobs;
+        } else if (opt == CxxFlagOptTag || opt == LdFlagOptTag || opt == DefineOptTag || opt == IncludeOptTag
+            || opt == SourceOptTag || opt == ExcludeOptTag) {
+            if (idx + 1 >= opts.size()) {
+                std::println("Error: Invalid option '{}' in {}, option didn't have parameter", opt, source);
+                return false;
+            }
+
+            const auto value = opts[++idx];
+            if (opt == CxxFlagOptTag) {
+                context.user_cxx_flags.emplace_back(value);
+            } else if (opt == LdFlagOptTag) {
+                context.user_ld_flags.emplace_back(value);
+            } else if (opt == DefineOptTag) {
+                context.defines.emplace_back(value);
+            } else if (opt == IncludeOptTag) {
+                context.include_dirs.emplace_back(value);
+            } else if (opt == SourceOptTag) {
+                context.source_filters.emplace_back(value);
+            } else {
+                context.exclude_filters.emplace_back(value);
+            }
         }
     }
 
@@ -2761,6 +2955,17 @@ auto parse_project_config(const fs::path& config_path, ProjectConfig& project) -
             continue;
         }
 
+        if (tokens[0] == "common") {
+            if (tokens.size() < 2) {
+                std::println("Error: bspm.build line {} expects 'common [options]'", line_number);
+                return false;
+            }
+
+            project.common_build_options.insert(std::end(project.common_build_options), std::next(std::begin(tokens)),
+                std::end(tokens));
+            continue;
+        }
+
         if (tokens[0] != "target") {
             std::println("Error: unknown bspm.build directive '{}' on line {}", tokens[0], line_number);
             return false;
@@ -2794,17 +2999,25 @@ auto parse_project_config(const fs::path& config_path, ProjectConfig& project) -
             return false;
         }
 
+        project.targets.push_back(std::move(target));
+    }
+
+    Context common_validation_context;
+    auto common_option_views = build_option_views(project.common_build_options);
+    if (!apply_build_options(common_validation_context, common_option_views, "bspm.build common options")) {
+        return false;
+    }
+
+    for (const auto& target : project.targets) {
         Context validation_context;
-        std::vector<std::string_view> option_views;
-        option_views.reserve(target.build_options.size());
-        for (const auto& option : target.build_options) {
-            option_views.push_back(option);
-        }
-        if (!apply_build_options(validation_context, option_views, "bspm.build target options")) {
+        auto common_views = build_option_views(project.common_build_options);
+        auto target_views = build_option_views(target.build_options);
+        if (!apply_build_options(validation_context, common_views, "bspm.build common options")) {
             return false;
         }
-
-        project.targets.push_back(std::move(target));
+        if (!apply_build_options(validation_context, target_views, "bspm.build target options")) {
+            return false;
+        }
     }
 
     if (project.targets.empty()) {
@@ -2960,6 +3173,30 @@ auto init_context(Context& context, std::string_view command, const InitConfigur
                             "parameter");
                         return false;
                     }
+                } else if (opt == CxxFlagOptTag || opt == LdFlagOptTag || opt == DefineOptTag || opt == IncludeOptTag
+                    || opt == SourceOptTag || opt == ExcludeOptTag) {
+                    if (idx + 1 < conf.argc) {
+                        idx++;
+                        std::string_view value { conf.argv[idx] };
+
+                        if (opt == CxxFlagOptTag) {
+                            context.user_cxx_flags.emplace_back(value);
+                        } else if (opt == LdFlagOptTag) {
+                            context.user_ld_flags.emplace_back(value);
+                        } else if (opt == DefineOptTag) {
+                            context.defines.emplace_back(value);
+                        } else if (opt == IncludeOptTag) {
+                            context.include_dirs.emplace_back(value);
+                        } else if (opt == SourceOptTag) {
+                            context.source_filters.emplace_back(value);
+                        } else {
+                            context.exclude_filters.emplace_back(value);
+                        }
+                    } else {
+                        std::println("Error: Invalid option '{}' for {} command, option didn't have {}", opt, command,
+                            "parameter");
+                        return false;
+                    }
                 }
             }
 
@@ -2993,9 +3230,13 @@ auto build_option_views(const std::vector<std::string>& options) -> std::vector<
     return views;
 }
 
-auto create_target_context(const TargetConfig& target, std::span<const std::string_view> cli_options, Context& context)
-    -> bool {
+auto create_target_context(const ProjectConfig& project, const TargetConfig& target,
+    std::span<const std::string_view> cli_options, Context& context) -> bool {
+    auto common_options = build_option_views(project.common_build_options);
     auto config_options = build_option_views(target.build_options);
+    if (!apply_build_options(context, common_options, "bspm.build common options")) {
+        return false;
+    }
     if (!apply_build_options(context, config_options, "bspm.build target options")) {
         return false;
     }
@@ -3167,7 +3408,7 @@ auto build_project(const ProjectConfig& project, std::span<const std::string_vie
 
     for (const auto* target : build_order) {
         Context target_context;
-        if (!create_target_context(*target, cli_options, target_context)) {
+        if (!create_target_context(project, *target, cli_options, target_context)) {
             return false;
         }
         if (!collect_target_dependency_artifacts(project, *target, built_artifacts, target_context)) {
@@ -3182,8 +3423,9 @@ auto build_project(const ProjectConfig& project, std::span<const std::string_vie
     return true;
 }
 
-auto create_configured_target_context(const TargetConfig& target, bool verbose, Context& context) -> bool {
-    if (!create_target_context(target, {}, context)) {
+auto create_configured_target_context(
+    const ProjectConfig& project, const TargetConfig& target, bool verbose, Context& context) -> bool {
+    if (!create_target_context(project, target, {}, context)) {
         return false;
     }
     context.verbose = verbose;
@@ -3198,7 +3440,7 @@ auto run_project_target(const ProjectConfig& project, std::string_view target_na
     }
 
     Context target_context;
-    if (!create_configured_target_context(*target, verbose, target_context)) {
+    if (!create_configured_target_context(project, *target, verbose, target_context)) {
         return false;
     }
 
@@ -3215,7 +3457,7 @@ auto clean_project_targets(const ProjectConfig& project, std::span<const std::st
         }
 
         Context target_context;
-        if (!create_configured_target_context(*target, verbose, target_context)) {
+        if (!create_configured_target_context(project, *target, verbose, target_context)) {
             return false;
         }
         if (!clean_command(target_context, project.root / target->path)) {
