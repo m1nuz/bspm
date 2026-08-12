@@ -107,6 +107,11 @@ Print build commands without running them
 bspm build <dir> --dry-run
 ```
 
+Print the discovered source/module graph before building
+```console
+bspm build <dir> --explain
+```
+
 Compile independent source files in parallel
 ```console
 bspm build <dir> -j 4
@@ -164,6 +169,14 @@ project root instead of as one plain folder target:
 bspm build examples/project-config --project
 ```
 
+Inspect discovered targets, source units, module declarations, and imports
+without compiling:
+```console
+bspm graph <dir>
+bspm graph all
+bspm graph examples/project-config --project
+```
+
 `bspm.build` uses a small shell-like syntax:
 - `project <name>` names the project.
 - `default <target>` chooses what bare `build`, `run`, and `clean` mean.
@@ -197,6 +210,13 @@ Run executable
 bspm run <dir>
 ```
 
+Check local compiler/linker tools
+```console
+bspm doctor
+bspm doctor -c clang++
+bspm doctor -c msvc
+```
+
 Clean project and remove generated files
 ```console
 bspm clean <dir>
@@ -208,6 +228,8 @@ Show help
 ```console
 bspm help
 bspm help build
+bspm help graph
+bspm help doctor
 ```
 
 See `examples/README.md` for a tour of the included example targets.

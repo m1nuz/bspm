@@ -54,6 +54,8 @@ constexpr char BuildTag[] = "build";
 constexpr char RunTag[] = "run";
 constexpr char CleanTag[] = "clean";
 constexpr char InitTag[] = "init";
+constexpr char DoctorTag[] = "doctor";
+constexpr char GraphTag[] = "graph";
 
 constexpr char GPPCompilerTag[] = "g++";
 constexpr char GCCCompilerTag[] = "gcc";
@@ -70,6 +72,8 @@ std::string_view commands[] {
     HelpTag,
     InitTag,
     BuildTag,
+    DoctorTag,
+    GraphTag,
     RunTag,
     CleanTag,
     VersionTag,
@@ -85,6 +89,7 @@ constexpr std::string_view LongOutputOptTag { "--output" };
 constexpr std::string_view DebugOptTag { "--debug" };
 constexpr std::string_view ReleaseOptTag { "--release" };
 constexpr std::string_view DryRunOptTag { "--dry-run" };
+constexpr std::string_view ExplainOptTag { "--explain" };
 constexpr std::string_view DependsOptTag { "--depends" };
 constexpr std::string_view ProjectOptTag { "--project" };
 constexpr std::string_view JobsOptTag { "-j" };
@@ -107,6 +112,7 @@ std::array BuildOpts {
     DebugOptTag,
     ReleaseOptTag,
     DryRunOptTag,
+    ExplainOptTag,
     ProjectOptTag,
     JobsOptTag,
     LongJobsOptTag,
@@ -229,6 +235,7 @@ struct Context {
     bool verbose { false };
     bool debug { true };
     bool dry_run { false };
+    bool explain { false };
     bool output_name_configured { false };
     bool project_init { false };
     std::size_t jobs { 1 };
@@ -265,6 +272,10 @@ struct BuiltTargetArtifacts {
 
 auto configure_target_paths(Context& context, const fs::path& source_dir) -> void;
 auto build_option_views(const std::vector<std::string>& options) -> std::vector<std::string_view>;
+auto init_gcc_compiler(Context& context) -> void;
+auto init_clang_compiler(Context& context) -> void;
+auto init_msvc_compiler(Context& context) -> void;
+auto is_option_argument(std::string_view argument) -> bool;
 
 auto quote_arg(std::string_view arg) -> std::string {
     const bool needs_quotes = arg.find_first_of(" \t\"") != std::string_view::npos;
@@ -345,6 +356,215 @@ auto find_vs_dev_cmd() -> fs::path {
 #endif
 
     return {};
+}
+
+auto environment_path_entries() -> std::vector<fs::path> {
+    std::vector<fs::path> entries;
+    const char* raw_path = std::getenv("PATH");
+    if (!raw_path || !*raw_path) {
+        return entries;
+    }
+
+    std::string_view path { raw_path };
+#if defined(_WIN32) || defined(_WIN64)
+    constexpr char separator = ';';
+#else
+    constexpr char separator = ':';
+#endif
+
+    std::size_t start = 0;
+    while (start <= path.size()) {
+        const auto end = path.find(separator, start);
+        const auto part = path.substr(start, end == std::string_view::npos ? std::string_view::npos : end - start);
+        if (!part.empty()) {
+            entries.emplace_back(part);
+        }
+        if (end == std::string_view::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    return entries;
+}
+
+auto executable_candidates(std::string_view executable) -> std::vector<fs::path> {
+    fs::path requested { executable };
+#if defined(_WIN32) || defined(_WIN64)
+    if (!requested.extension().empty()) {
+        return { requested };
+    }
+
+    std::vector<fs::path> candidates;
+    if (const char* raw_extensions = std::getenv("PATHEXT"); raw_extensions && *raw_extensions) {
+        std::string_view extensions { raw_extensions };
+        std::size_t start = 0;
+        while (start <= extensions.size()) {
+            const auto end = extensions.find(';', start);
+            const auto part
+                = extensions.substr(start, end == std::string_view::npos ? std::string_view::npos : end - start);
+            if (!part.empty()) {
+                candidates.emplace_back(std::string { executable } + std::string { part });
+            }
+            if (end == std::string_view::npos) {
+                break;
+            }
+            start = end + 1;
+        }
+    }
+
+    candidates.push_back(requested);
+    candidates.emplace_back(std::string { executable } + ".exe");
+    return candidates;
+#else
+    return { requested };
+#endif
+}
+
+auto find_executable_on_path(std::string_view executable) -> fs::path {
+    const fs::path requested { executable };
+    std::error_code ec;
+    if (requested.has_parent_path() && fs::exists(requested, ec)) {
+        return requested;
+    }
+
+    for (const auto& directory : environment_path_entries()) {
+        for (const auto& candidate_name : executable_candidates(executable)) {
+            auto candidate = directory / candidate_name;
+            if (fs::exists(candidate, ec) && fs::is_regular_file(candidate, ec)) {
+                return candidate;
+            }
+        }
+    }
+
+    return {};
+}
+
+auto compiler_label(Compiler compiler) -> std::string_view {
+    switch (compiler) {
+    case Compiler::GCC:
+        return "gcc";
+    case Compiler::Clang:
+        return "clang";
+    case Compiler::MSVC:
+        return "msvc";
+    }
+
+    return "unknown";
+}
+
+auto select_compiler(Context& context, std::string_view compiler, std::string_view source) -> bool {
+    if (compiler == GPPCompilerTag || compiler == GCCCompilerTag) {
+        init_gcc_compiler(context);
+        return true;
+    }
+    if (compiler == ClangPPCompilerTag || compiler == ClangCompilerTag) {
+        init_clang_compiler(context);
+        return true;
+    }
+    if (compiler == MSVCCompilerTag || compiler == CLCompilerTag || compiler == CLExeCompilerTag) {
+        init_msvc_compiler(context);
+        return true;
+    }
+
+    std::println("Error: Unknown compiler parameter {} in {}", compiler, source);
+    return false;
+}
+
+auto print_doctor_check(std::string_view status, std::string_view label, std::string_view detail = {}) -> void {
+    if (detail.empty()) {
+        std::println("[{}] {}", status, label);
+    } else {
+        std::println("[{}] {}: {}", status, label, detail);
+    }
+}
+
+auto doctor_command(Context& context) -> bool {
+    std::println("{} doctor", context.name);
+    std::println("profile: {}", compiler_label(context.compiler));
+
+    bool ok = true;
+    auto check_tool = [&](std::string_view label, std::string_view executable, bool required = true) {
+        auto path = find_executable_on_path(executable);
+        if (path.empty()) {
+            print_doctor_check(required ? "fail" : "warn", label, std::string { executable } + " was not found on PATH");
+            ok = ok && !required;
+            return;
+        }
+
+        print_doctor_check("ok", label, path.string());
+    };
+
+    if (context.compiler == Compiler::GCC) {
+        check_tool("C++ compiler", context.cpp_c);
+        check_tool("C compiler", context.cc);
+        check_tool("static library archiver", "ar");
+        print_doctor_check("note", "modules", "GCC C++ module support is enabled with -fmodules");
+        if (context.ld_flags.find("-lstdc++exp") != std::string::npos) {
+            print_doctor_check("note", "standard library", "import std may need libstdc++exp");
+        }
+    } else if (context.compiler == Compiler::Clang) {
+        check_tool("C++ compiler", context.cpp_c);
+        check_tool("static library archiver", "ar");
+        print_doctor_check("note", "modules", "Clang C++ module support is enabled with -fprebuilt-module-path");
+    } else {
+        const auto cl_path = find_executable_on_path("cl.exe");
+        if (!cl_path.empty()) {
+            print_doctor_check("ok", "C++ compiler", cl_path.string());
+        } else if (!context.msvc_dev_cmd.empty()) {
+            print_doctor_check("ok", "C++ compiler", "cl.exe will be loaded through VsDevCmd.bat");
+        } else {
+            print_doctor_check("fail", "C++ compiler", "cl.exe was not found on PATH");
+            ok = false;
+        }
+
+        const auto lib_path = find_executable_on_path("lib.exe");
+        if (!lib_path.empty()) {
+            print_doctor_check("ok", "static library archiver", lib_path.string());
+        } else if (!context.msvc_dev_cmd.empty()) {
+            print_doctor_check("ok", "static library archiver", "lib.exe will be loaded through VsDevCmd.bat");
+        } else {
+            print_doctor_check("fail", "static library archiver", "lib.exe was not found on PATH");
+            ok = false;
+        }
+
+        if (!context.msvc_dev_cmd.empty()) {
+            print_doctor_check("ok", "Visual Studio developer environment", context.msvc_dev_cmd.string());
+        } else {
+            print_doctor_check("warn", "Visual Studio developer environment", "VsDevCmd.bat was not found");
+        }
+        print_doctor_check("note", "modules", "MSVC module support is enabled with /interface and /ifcSearchDir");
+    }
+
+    print_doctor_check("note", "build directory", "generated files are written under <target>/build/<profile>");
+    return ok;
+}
+
+auto init_doctor_context(Context& context, int argc, char* argv[], int32_t index) -> bool {
+    for (int32_t idx = index; idx < argc; ++idx) {
+        std::string_view opt { argv[idx] };
+
+        if (opt == VerboseOptTag) {
+            context.verbose = true;
+            continue;
+        }
+
+        if (opt != CompilerOptTag) {
+            std::println("Error: Invalid option '{}' for {} command", opt, DoctorTag);
+            return false;
+        }
+
+        if (idx + 1 >= argc || is_option_argument(argv[idx + 1])) {
+            std::println("Error: Invalid option '{}' for {} command, option didn't have parameter", opt, DoctorTag);
+            return false;
+        }
+
+        if (!select_compiler(context, argv[++idx], "doctor command")) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 auto wrap_msvc_command(const Context& context, std::string_view command) -> std::string {
@@ -848,6 +1068,7 @@ auto help_command(Context& context, std::string_view command) -> void {
         std::println("\t--debug\t\t\tBuild with debug flags");
         std::println("\t--release\t\tBuild with optimization flags and NDEBUG");
         std::println("\t--dry-run\t\tPrint compile/link commands without running them");
+        std::println("\t--explain\t\tPrint discovered graph before building");
         std::println("\t--project\t\tTreat [dir] as a project root containing bspm.build");
         std::println("\t-j, --jobs <count>\tCompile independent source files in parallel");
         std::println("\t--cxxflag <flag>\tAdd a compiler flag");
@@ -857,6 +1078,23 @@ auto help_command(Context& context, std::string_view command) -> void {
         std::println("\t--source <path>\t\tRestrict source discovery to a file or directory");
         std::println("\t--exclude <path>\tExclude a file or directory from source discovery");
         std::println("\t-v\t\t\tPrint commands while building");
+        return;
+    }
+
+    if (command == DoctorTag) {
+        std::println("Usage:");
+        std::println("\t{} {} [-c <g++|clang++|msvc>] [-v]", context.name, DoctorTag);
+        std::println("");
+        std::println("Check local compiler and linker tools used by {}.", context.name);
+        return;
+    }
+
+    if (command == GraphTag) {
+        std::println("Usage:");
+        std::println("\t{} {} [dir|target|all] [options]", context.name, GraphTag);
+        std::println("");
+        std::println("Print discovered project targets, source units, module declarations, and imports.");
+        std::println("Accepts the same build selection options as '{} {}'.", context.name, BuildTag);
         return;
     }
 
@@ -1717,6 +1955,118 @@ auto collect_source_entries(const Context& context) -> std::vector<fs::directory
     return entries;
 }
 
+auto module_unit_kind_name(ModuleUnitKind kind) -> std::string_view {
+    switch (kind) {
+    case ModuleUnitKind::None:
+        return "source";
+    case ModuleUnitKind::PrimaryInterface:
+        return "primary interface";
+    case ModuleUnitKind::Implementation:
+        return "implementation";
+    case ModuleUnitKind::PartitionInterface:
+        return "partition interface";
+    case ModuleUnitKind::InternalPartition:
+        return "internal partition";
+    }
+
+    return "unknown";
+}
+
+auto target_kind_name(Target target) -> std::string_view {
+    switch (target) {
+    case Target::Bin:
+        return "bin";
+    case Target::Lib:
+        return "lib";
+    case Target::Shared:
+        return "shared";
+    }
+
+    return "unknown";
+}
+
+auto sorted_strings(const std::unordered_set<std::string>& values) -> std::vector<std::string> {
+    std::vector<std::string> sorted { std::begin(values), std::end(values) };
+    std::sort(std::begin(sorted), std::end(sorted));
+    return sorted;
+}
+
+auto print_named_list(std::string_view label, const std::vector<std::string>& values) -> void {
+    if (values.empty()) {
+        return;
+    }
+
+    std::print("    {}:", label);
+    for (const auto& value : values) {
+        std::print(" {}", value);
+    }
+    std::println("");
+}
+
+auto prepare_build_plan(Context& context, fs::path dir) -> bool {
+    dir = !dir.empty() ? dir : ".";
+
+    auto search_path = fs::absolute(dir);
+    if (!fs::exists(search_path) || !fs::is_directory(search_path)) {
+        std::println("Error: '{}' not exists!", search_path.string());
+        return false;
+    }
+
+    configure_target_paths(context, search_path);
+
+    auto entries = collect_source_entries(context);
+
+    // Sort sources with .cppm first, then keep the initial order deterministic.
+    std::sort(std::begin(entries), std::end(entries), [&context](const auto& a, const auto& b) {
+        if (is_cppm(a) != is_cppm(b)) {
+            return is_cppm(a);
+        }
+
+        std::error_code a_ec;
+        std::error_code b_ec;
+        auto a_path = fs::relative(a.path(), context.source_dir, a_ec);
+        auto b_path = fs::relative(b.path(), context.source_dir, b_ec);
+        return (a_ec ? a.path() : a_path).generic_string() < (b_ec ? b.path() : b_path).generic_string();
+    });
+
+    if (!process_units_imports(context, entries)) {
+        return false;
+    }
+
+    return sort_units_by_dependency(context);
+}
+
+auto print_build_graph(const Context& context, std::string_view target_name = {}) -> void {
+    if (!target_name.empty()) {
+        std::println("target: {}", target_name);
+    }
+    std::println("source: {}", context.source_dir.string());
+    std::println("build: {}", context.build_dir.string());
+    std::println("output: {}", context.output_name);
+    std::println("type: {}", target_kind_name(context.target));
+    std::println("compiler: {}", context.cpp_c);
+
+    print_named_list("header units", context.import_sys_headers);
+    print_named_list("std modules", context.import_std_modules);
+
+    if (context.compile_units.empty()) {
+        std::println("units: none");
+        return;
+    }
+
+    std::println("units:");
+    for (std::size_t index = 0; index < context.compile_units.size(); ++index) {
+        const auto& unit = context.compile_units[index];
+        std::println("  {}. {} [{}]", index + 1, unit.file_name, module_unit_kind_name(unit.module_kind));
+        if (!unit.module_name.empty()) {
+            std::println("    provides: {}", unit.module_name);
+        }
+        print_named_list("imports", sorted_strings(unit.imports));
+        print_named_list("std imports", sorted_strings(unit.std_module_imports));
+        print_named_list("module imports", sorted_strings(unit.module_imports));
+    }
+}
+
 auto ensure_parent_directory(const fs::path& path) -> bool {
     if (path.parent_path().empty()) {
         return true;
@@ -2102,42 +2452,12 @@ auto compile_units(Context& context) -> bool {
 }
 
 auto build_command(Context& context, fs::path dir) -> bool {
-    dir = !dir.empty() ? dir : ".";
-
-    // if (context.verbose) {
-    //     std::println("{} build '{}'", context.name, dir.string());
-    //     return execute_command(context, context.cpp_c, std::array { std::string { "-v" } });
-    // }
-
-    auto search_path = fs::absolute(dir);
-    if (!fs::exists(search_path) || !fs::is_directory(search_path)) {
-        std::println("Error: '{}' not exists!", search_path.string());
+    if (!prepare_build_plan(context, dir)) {
         return false;
     }
 
-    configure_target_paths(context, search_path);
-
-    auto entries = collect_source_entries(context);
-
-    // Sort sources with .cppm first, then keep the initial order deterministic.
-    std::sort(std::begin(entries), std::end(entries), [&context](const auto& a, const auto& b) {
-        if (is_cppm(a) != is_cppm(b)) {
-            return is_cppm(a);
-        }
-
-        std::error_code a_ec;
-        std::error_code b_ec;
-        auto a_path = fs::relative(a.path(), context.source_dir, a_ec);
-        auto b_path = fs::relative(b.path(), context.source_dir, b_ec);
-        return (a_ec ? a.path() : a_path).generic_string() < (b_ec ? b.path() : b_path).generic_string();
-    });
-
-    if (!process_units_imports(context, entries)) {
-        return false;
-    }
-
-    if (!sort_units_by_dependency(context)) {
-        return false;
+    if (context.explain) {
+        print_build_graph(context);
     }
 
     if (!remove_gcc_header_unit_cache(context)) {
@@ -2843,6 +3163,8 @@ auto apply_build_options(Context& context, std::span<const std::string_view> opt
             context.debug = false;
         } else if (opt == DryRunOptTag) {
             context.dry_run = true;
+        } else if (opt == ExplainOptTag) {
+            context.explain = true;
         } else if (opt == CompilerOptTag) {
             if (idx + 1 >= opts.size() || is_option_argument(opts[idx + 1])) {
                 std::println("Error: Invalid option '{}' in {}, option didn't have parameter", opt, source);
@@ -3059,6 +3381,8 @@ auto init_context(Context& context, std::string_view command, const InitConfigur
     context.output_name = "a.out";
 #endif
 
+    const bool build_like_command = command == BuildTag || command == GraphTag;
+
     if (conf.argv && conf.index < conf.argc) {
         int32_t idx = conf.index;
 
@@ -3071,7 +3395,7 @@ auto init_context(Context& context, std::string_view command, const InitConfigur
                 continue;
             }
 
-            if (command != BuildTag) {
+            if (!build_like_command) {
                 if (command != InitTag || !check_option(InitOpts, opt)) {
                     std::println("Error: Invalid option '{}' for {} command", opt, command);
                     return false;
@@ -3085,7 +3409,7 @@ auto init_context(Context& context, std::string_view command, const InitConfigur
                 continue;
             }
 
-            if (command == BuildTag) {
+            if (build_like_command) {
                 if (!check_option(BuildOpts, opt)) {
                     std::println("Error: Invalid option '{}' for {} command", opt, command);
                     return false;
@@ -3103,6 +3427,8 @@ auto init_context(Context& context, std::string_view command, const InitConfigur
                     context.debug = false;
                 } else if (opt == DryRunOptTag) {
                     context.dry_run = true;
+                } else if (opt == ExplainOptTag) {
+                    context.explain = true;
                 }
 
                 if (opt == CompilerOptTag) {
@@ -3204,7 +3530,7 @@ auto init_context(Context& context, std::string_view command, const InitConfigur
         }
     }
 
-    if (command == BuildTag) {
+    if (build_like_command) {
         finalize_build_context(context);
     }
 
@@ -3423,6 +3749,52 @@ auto build_project(const ProjectConfig& project, std::span<const std::string_vie
     return true;
 }
 
+auto graph_command(Context& context, fs::path dir, std::string_view target_name = {}) -> bool {
+    if (!prepare_build_plan(context, dir)) {
+        return false;
+    }
+
+    print_build_graph(context, target_name);
+    return true;
+}
+
+auto graph_project(const ProjectConfig& project, std::span<const std::string_view> requested_targets,
+    std::span<const std::string_view> cli_options) -> bool {
+    std::vector<const TargetConfig*> build_order;
+    if (!collect_project_build_order(project, requested_targets, build_order)) {
+        return false;
+    }
+
+    std::println("project: {}", project.name.empty() ? project.root.filename().string() : project.name);
+    std::println("root: {}", project.root.string());
+    std::print("target order:");
+    for (const auto* target : build_order) {
+        std::print(" {}", target->name);
+    }
+    std::println("");
+
+    for (const auto* target : build_order) {
+        Context target_context;
+        if (!create_target_context(project, *target, cli_options, target_context)) {
+            return false;
+        }
+
+        if (!target->dependencies.empty()) {
+            std::print("depends({}):", target->name);
+            for (const auto& dependency : target->dependencies) {
+                std::print(" {}", dependency);
+            }
+            std::println("");
+        }
+
+        if (!graph_command(target_context, project.root / target->path, target->name)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 auto create_configured_target_context(
     const ProjectConfig& project, const TargetConfig& target, bool verbose, Context& context) -> bool {
     if (!create_target_context(project, target, {}, context)) {
@@ -3521,6 +3893,14 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    if (command == DoctorTag) {
+        if (!init_doctor_context(context, argc, argv, 2)) {
+            std::println("Type '{} help {}' for more description.", context.name, DoctorTag);
+            return 1;
+        }
+        return doctor_command(context) ? 0 : 1;
+    }
+
     ProjectConfig project;
     bool project_present = false;
     if (!load_project_config_if_present(project, project_present) && project_present) {
@@ -3588,6 +3968,69 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         return build_command(context, dir) ? 0 : 1;
+    }
+
+    if (command == GraphTag) {
+        fs::path dir;
+        int32_t option_index = 2;
+        if (argc > 2 && !is_option_argument(argv[2])) {
+            dir = argv[2];
+            option_index = 3;
+        }
+
+        std::vector<std::string_view> cli_options;
+        for (int32_t idx = option_index; idx < argc; ++idx) {
+            cli_options.push_back(argv[idx]);
+        }
+
+        const bool force_project = contains_option(cli_options, ProjectOptTag);
+        if (force_project) {
+            ProjectConfig explicit_project;
+            bool explicit_project_present = false;
+            const auto project_root = dir.empty() ? fs::current_path() : dir;
+            if (!load_project_config_if_present(explicit_project, explicit_project_present, project_root)) {
+                if (!explicit_project_present) {
+                    std::println(
+                        "Error: '{}' does not contain a non-empty bspm.build", fs::absolute(project_root).string());
+                }
+                return 1;
+            }
+
+            project = std::move(explicit_project);
+            project_present = true;
+        }
+
+        const auto subject = dir.generic_string();
+        const bool use_project = force_project
+            || (project_present && (dir.empty() || subject == "all" || has_project_target(project, subject)));
+        if (use_project) {
+            std::vector<std::string_view> requested_targets;
+            if (force_project) {
+                if (!project.default_target.empty()) {
+                    requested_targets.push_back(project.default_target);
+                } else {
+                    std::println("Error: project does not define a default target");
+                    return 1;
+                }
+            } else if (subject == "all") {
+                requested_targets = project_target_names(project);
+            } else if (!dir.empty()) {
+                requested_targets.push_back(subject);
+            } else if (!project.default_target.empty()) {
+                requested_targets.push_back(project.default_target);
+            } else {
+                std::println("Error: project does not define a default target");
+                return 1;
+            }
+
+            return graph_project(project, requested_targets, cli_options) ? 0 : 1;
+        }
+
+        if (!init_context(context, GraphTag, { .argc = argc, .index = option_index, .argv = argv })) {
+            std::println("Type '{} help {}' for more description.", context.name, GraphTag);
+            return 1;
+        }
+        return graph_command(context, dir) ? 0 : 1;
     }
 
     if (command == RunTag) {

@@ -188,9 +188,16 @@ def assert_generated_project_scaffolds(bspm: Path, workspace: Path) -> None:
     expect((project / "app" / "main.cpp").is_file(), "project init should create app/main.cpp")
 
 
-def assert_cli_basics(bspm: Path) -> None:
+def assert_cli_basics(bspm: Path, toolchain: Toolchain) -> None:
     help_result = run([bspm, "help"])
     expect("Usage:" in help_result.stdout, "help output should include Usage")
+
+    doctor_result = run([bspm, "doctor", "-c", toolchain.bspm_selector])
+    expect("bspm doctor" in doctor_result.stdout, "doctor output should include command title")
+    expect("profile:" in doctor_result.stdout, "doctor output should include selected profile")
+
+    graph_help_result = run([bspm, "help", "graph"])
+    expect("discovered project targets" in graph_help_result.stdout, "graph help should describe graph output")
 
     version_result = run([bspm, "version"])
     expect(version_result.stdout.startswith("bspm "), "version output should start with 'bspm '")
@@ -203,6 +210,9 @@ def assert_dry_run_plans(bspm: Path, workspace: Path, toolchain: Toolchain) -> N
     simple = copy_fixture("simple-bin", workspace, suffix="-dry-run")
     simple_result = run(build_command(bspm, toolchain, simple, "--dry-run"))
     expect("command:" in simple_result.stdout, "simple build dry-run should print commands")
+
+    explain_result = run(build_command(bspm, toolchain, simple, "--dry-run", "--explain"))
+    expect("units:" in explain_result.stdout, "build --explain should print discovered units")
 
     flag_result = run(
         build_command(
@@ -226,6 +236,12 @@ def assert_dry_run_plans(bspm: Path, workspace: Path, toolchain: Toolchain) -> N
     project = copy_fixture("project-config", workspace, suffix="-dry-run")
     project_result = run(build_command(bspm, toolchain, project, "--project", "--dry-run"))
     expect("command:" in project_result.stdout, "project build dry-run should print commands")
+
+    graph_result = run([bspm, "graph", nested, "-c", toolchain.bspm_selector])
+    expect("module imports:" in graph_result.stdout, "graph should print module imports")
+
+    project_graph_result = run([bspm, "graph", project, "--project", "-c", toolchain.bspm_selector])
+    expect("target order:" in project_graph_result.stdout, "project graph should print target order")
 
 
 def assert_simple_binary(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:
@@ -348,7 +364,7 @@ def main() -> int:
         workspace = Path(temporary)
         bspm = build_bspm(workspace, toolchain)
 
-        assert_cli_basics(bspm)
+        assert_cli_basics(bspm, toolchain)
         assert_generated_project_scaffolds(bspm, workspace)
         assert_dry_run_plans(bspm, workspace, toolchain)
 
