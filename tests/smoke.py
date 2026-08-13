@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Literal
@@ -294,25 +295,41 @@ def assert_parallel_build(bspm: Path, workspace: Path, toolchain: Toolchain) -> 
 
 def assert_user_build_options(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:
     fixture = copy_fixture("user-options", workspace)
-    run(
-        build_command(
-            bspm,
-            toolchain,
-            fixture,
-            "--source",
-            ".",
-            "--exclude",
-            "ignored",
-            "--include",
-            "include",
-            "--define",
-            "BSPM_DEFINE_VALUE=12",
-            "--cxxflag",
-            "-DBSPM_CXXFLAG_VALUE=30",
-        )
-    )
+    options = [
+        "--source",
+        ".",
+        "--exclude",
+        "ignored",
+        "--include",
+        "include",
+        "--define",
+        "BSPM_DEFINE_VALUE=12",
+        "--cxxflag",
+        "-DBSPM_CXXFLAG_VALUE=30",
+    ]
+    run(build_command(bspm, toolchain, fixture, *options))
     result = run([bspm, "run", fixture])
     expect(result.stdout.strip() == "user-options: 42", "user build options should affect compile and discovery")
+
+    if toolchain.name != "msvc":
+        depfile = fixture / "build" / toolchain.profile / "main.o.d"
+        expect(depfile.is_file(), "non-MSVC builds should write a source dependency file")
+
+        incremental_result = run(build_command(bspm, toolchain, fixture, *options, "-v"))
+        expect("up to date: main.cpp" in incremental_result.stdout, "unchanged header user-options build should skip main")
+
+        header = fixture / "include" / "config.hpp"
+        header.write_text(header.read_text() + "\n// depfile rebuild check\n")
+        future = time.time() + 2
+        os.utime(header, (future, future))
+
+        header_result = run(build_command(bspm, toolchain, fixture, *options, "-v"))
+        expect(
+            "up to date: main.cpp" not in header_result.stdout,
+            "changing an included header should rebuild the including source",
+        )
+        result = run([bspm, "run", fixture])
+        expect(result.stdout.strip() == "user-options: 42", "header-triggered rebuild should still produce a runnable app")
 
 
 def assert_library_outputs(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:

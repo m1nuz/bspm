@@ -282,6 +282,7 @@ struct CompileCommandEntry {
 struct SourceCompilePlan {
     std::vector<std::string> args;
     fs::path output;
+    fs::path depfile;
 };
 
 auto configure_target_paths(Context& context, const fs::path& source_dir) -> void;
@@ -290,6 +291,7 @@ auto init_gcc_compiler(Context& context) -> void;
 auto init_clang_compiler(Context& context) -> void;
 auto init_msvc_compiler(Context& context) -> void;
 auto is_option_argument(std::string_view argument) -> bool;
+auto path_is_within_or_equal(const fs::path& path, const fs::path& parent) -> bool;
 
 auto quote_arg(std::string_view arg) -> std::string {
     const bool needs_quotes = arg.find_first_of(" \t\"") != std::string_view::npos;
@@ -969,6 +971,113 @@ auto inputs_are_not_newer_than(const fs::file_time_type& output_time, std::span<
     return true;
 }
 
+auto tokenize_depfile_dependencies(std::string_view dependencies) -> std::vector<std::string> {
+    std::vector<std::string> tokens;
+    std::string token;
+    bool escaped = false;
+
+    auto flush_token = [&] {
+        if (!token.empty()) {
+            tokens.push_back(std::move(token));
+            token.clear();
+        }
+    };
+
+    for (char ch : dependencies) {
+        if (escaped) {
+            if (ch != '\r' && ch != '\n') {
+                token.push_back(ch);
+            }
+            escaped = false;
+            continue;
+        }
+
+        if (ch == '\\') {
+            escaped = true;
+            continue;
+        }
+
+        if (std::isspace(static_cast<unsigned char>(ch))) {
+            flush_token();
+            continue;
+        }
+
+        token.push_back(ch);
+    }
+
+    if (escaped) {
+        token.push_back('\\');
+    }
+    flush_token();
+    return tokens;
+}
+
+auto depfile_dependencies(const Context& context, const fs::path& depfile) -> std::vector<fs::path> {
+    std::ifstream file { depfile };
+    if (!file) {
+        return {};
+    }
+
+    std::string contents { std::istreambuf_iterator<char> { file }, std::istreambuf_iterator<char> {} };
+    std::string normalized;
+    normalized.reserve(contents.size());
+    for (std::size_t index = 0; index < contents.size(); ++index) {
+        const char ch = contents[index];
+        if (ch == '\\' && index + 1 < contents.size()
+            && (contents[index + 1] == '\n'
+                || (contents[index + 1] == '\r' && index + 2 < contents.size() && contents[index + 2] == '\n'))) {
+            normalized.push_back(' ');
+            if (contents[index + 1] == '\r') {
+                index += 2;
+            } else {
+                ++index;
+            }
+            continue;
+        }
+
+        normalized.push_back(ch);
+    }
+
+    const auto separator = normalized.find(':');
+    if (separator == std::string::npos) {
+        return {};
+    }
+
+    const auto dependency_start = separator + 1;
+    const auto dependency_end = normalized.find('\n', dependency_start);
+    const auto dependency_count
+        = dependency_end == std::string::npos ? std::string_view::npos : dependency_end - dependency_start;
+
+    std::vector<fs::path> dependencies;
+    for (const auto& token : tokenize_depfile_dependencies(
+             std::string_view { normalized }.substr(dependency_start, dependency_count))) {
+        fs::path path { token };
+        if (path.empty()) {
+            continue;
+        }
+        auto dependency = path.is_absolute() ? path : context.build_dir / path;
+        auto absolute_dependency = fs::absolute(dependency).lexically_normal();
+        auto absolute_build_dir = fs::absolute(context.build_dir).lexically_normal();
+        if (path_is_within_or_equal(absolute_dependency, absolute_build_dir)) {
+            continue;
+        }
+        dependencies.push_back(dependency);
+    }
+
+    return dependencies;
+}
+
+auto compile_depfile_path(const fs::path& unit_object_path) -> fs::path {
+    return fs::path { unit_object_path.string() + ".d" };
+}
+
+auto append_non_msvc_depfile_args(std::vector<std::string>& args, const fs::path& depfile) -> void {
+    args.push_back(std::string { "-MMD" });
+    args.push_back(std::string { "-MP" });
+    args.push_back(std::string { "-MF" });
+    args.push_back(path_arg(depfile));
+}
+
 auto build_step_signature(
     const std::string& command, std::span<const fs::path> outputs, std::span<const fs::path> inputs) -> std::string {
     std::string signature = command;
@@ -1012,12 +1121,24 @@ auto record_build_step(Context& context, std::span<const fs::path> outputs, cons
     context.build_state.dirty = true;
 }
 
-auto execute_incremental_command(Context& context, std::string_view command, std::span<const std::string> args,
-    std::span<const fs::path> outputs, std::span<const fs::path> inputs, std::string_view label) -> bool {
-    const auto invocation = make_process_invocation(context, command, args);
-    const auto signature = build_step_signature(invocation.display_command, outputs, inputs);
+auto inputs_with_depfile_dependencies(
+    const Context& context, std::span<const fs::path> inputs, const fs::path& depfile) -> std::vector<fs::path> {
+    std::vector<fs::path> all_inputs { std::begin(inputs), std::end(inputs) };
+    if (!depfile.empty()) {
+        auto dependencies = depfile_dependencies(context, depfile);
+        all_inputs.insert(std::end(all_inputs), std::begin(dependencies), std::end(dependencies));
+    }
+    return all_inputs;
+}
 
-    if (!context.dry_run && step_is_up_to_date(context, outputs, inputs, signature)) {
+auto execute_incremental_command(Context& context, std::string_view command, std::span<const std::string> args,
+    std::span<const fs::path> outputs, std::span<const fs::path> inputs, std::string_view label,
+    fs::path depfile = {}) -> bool {
+    const auto invocation = make_process_invocation(context, command, args);
+    const auto current_inputs = inputs_with_depfile_dependencies(context, inputs, depfile);
+    const auto signature = build_step_signature(invocation.display_command, outputs, current_inputs);
+
+    if (!context.dry_run && step_is_up_to_date(context, outputs, current_inputs, signature)) {
         if (context.verbose) {
             std::scoped_lock lock { context.output_mutex };
             std::println("up to date: {}", label);
@@ -1030,7 +1151,9 @@ auto execute_incremental_command(Context& context, std::string_view command, std
     }
 
     if (!context.dry_run) {
-        record_build_step(context, outputs, signature);
+        const auto recorded_inputs = inputs_with_depfile_dependencies(context, inputs, depfile);
+        const auto recorded_signature = build_step_signature(invocation.display_command, outputs, recorded_inputs);
+        record_build_step(context, outputs, recorded_signature);
     }
 
     return true;
@@ -2300,9 +2423,11 @@ auto source_compile_plan_for_unit(const Context& context, std::size_t unit_index
                 std::string { "-Wno-experimental-header-units" },
             },
             .output = clang_module_pcm_path(unit.module_name),
+            .depfile = compile_depfile_path(clang_module_pcm_path(unit.module_name)),
         };
         append_user_compile_args(plan.args, context);
         append_clang_unit_import_args(plan.args, context, unit, unit_index);
+        append_non_msvc_depfile_args(plan.args, plan.depfile);
         plan.args.push_back(path_arg(unit.file_path));
         plan.args.push_back(std::string { "-o" });
         plan.args.push_back(plan.output.generic_string());
@@ -2315,6 +2440,7 @@ auto source_compile_plan_for_unit(const Context& context, std::size_t unit_index
             context.cpp_flags,
         },
         .output = unit_object_path,
+        .depfile = context.compiler == Compiler::MSVC ? fs::path {} : compile_depfile_path(unit_object_path),
     };
     append_user_compile_args(plan.args, context);
 
@@ -2335,6 +2461,7 @@ auto source_compile_plan_for_unit(const Context& context, std::size_t unit_index
             plan.args.push_back(std::string { "/Fo" } + unit_object_path.string());
             plan.args.push_back(path_arg(unit.file_path));
         } else {
+            append_non_msvc_depfile_args(plan.args, plan.depfile);
             plan.args.push_back(std::string { "-xc++" });
             plan.args.push_back(std::string { "-c" });
             plan.args.push_back(path_arg(unit.file_path));
@@ -2353,8 +2480,10 @@ auto source_compile_plan_for_unit(const Context& context, std::size_t unit_index
     } else if (context.compiler == Compiler::Clang) {
         plan.args.push_back("-Wno-experimental-header-units");
         append_clang_unit_import_args(plan.args, context, unit, unit_index);
+        append_non_msvc_depfile_args(plan.args, plan.depfile);
         append_non_msvc_source_compile_args(plan.args, unit, unit_object_path, extension);
     } else {
+        append_non_msvc_depfile_args(plan.args, plan.depfile);
         append_non_msvc_source_compile_args(plan.args, unit, unit_object_path, extension);
     }
 
@@ -2472,13 +2601,19 @@ auto compile_object_only_unit(Context& context, std::size_t unit_index, const Co
         append_clang_unit_import_args(args, context, unit, unit_index);
     }
 
+    fs::path depfile;
     if (context.compiler != Compiler::MSVC) {
+        depfile = compile_depfile_path(unit_object_path);
+        append_non_msvc_depfile_args(args, depfile);
         append_non_msvc_source_compile_args(args, unit, unit_object_path, extension);
     }
 
     auto inputs = compile_unit_inputs(context, unit, unit_index);
     std::vector<fs::path> outputs { unit_object_path };
-    return execute_incremental_command(context, context.cpp_c, args, outputs, inputs, unit.file_name);
+    if (!depfile.empty()) {
+        outputs.push_back(depfile);
+    }
+    return execute_incremental_command(context, context.cpp_c, args, outputs, inputs, unit.file_name, depfile);
 }
 
 auto compile_clang_importable_unit(
@@ -2494,14 +2629,17 @@ auto compile_clang_importable_unit(
     append_user_compile_args(module_args, context);
 
     append_clang_unit_import_args(module_args, context, unit, unit_index);
+    const auto module_depfile = compile_depfile_path(clang_module_pcm_path(unit.module_name));
+    append_non_msvc_depfile_args(module_args, module_depfile);
 
     module_args.push_back(path_arg(unit.file_path));
     module_args.push_back(std::string { "-o" });
     module_args.push_back(clang_module_pcm_path(unit.module_name).generic_string());
 
     auto inputs = compile_unit_inputs(context, unit, unit_index);
-    std::vector<fs::path> outputs { clang_module_pcm_path(unit.module_name) };
-    if (!execute_incremental_command(context, context.cpp_c, module_args, outputs, inputs, unit.file_name + " module")) {
+    std::vector<fs::path> outputs { clang_module_pcm_path(unit.module_name), module_depfile };
+    if (!execute_incremental_command(
+            context, context.cpp_c, module_args, outputs, inputs, unit.file_name + " module", module_depfile)) {
         return false;
     }
 
@@ -2554,6 +2692,7 @@ auto compile_importable_unit(Context& context, std::size_t unit_index, const Com
         args.push_back(std::string { "/Fo" } + unit_object_path.string());
         args.push_back(path_arg(unit.file_path));
     } else {
+        append_non_msvc_depfile_args(args, compile_depfile_path(unit_object_path));
         args.push_back(std::string { "-xc++" });
         args.push_back(std::string { "-c" });
         args.push_back(path_arg(unit.file_path));
@@ -2563,7 +2702,12 @@ auto compile_importable_unit(Context& context, std::size_t unit_index, const Com
 
     auto inputs = compile_unit_inputs(context, unit, unit_index);
     auto outputs = compile_unit_outputs(context, unit, unit_object_path);
-    return execute_incremental_command(context, context.cpp_c, args, outputs, inputs, unit.file_name);
+    fs::path depfile;
+    if (context.compiler != Compiler::MSVC) {
+        depfile = compile_depfile_path(unit_object_path);
+        outputs.push_back(depfile);
+    }
+    return execute_incremental_command(context, context.cpp_c, args, outputs, inputs, unit.file_name, depfile);
 }
 
 auto compile_unit(Context& context, std::size_t unit_index) -> bool {

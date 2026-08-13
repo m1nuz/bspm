@@ -7,6 +7,14 @@ Experimental single-file tool for building C++ with Modules.
 `bspm` is intentionally dependency-free: compile `bspm.cpp` with a C++23
 compiler and use the resulting executable.
 
+## Table of Contents
+
+- [How to use](#how-to-use)
+  - [Example](#example)
+- [Optional project config](#optional-project-config)
+- [Tests](#tests)
+- [How to build](#how-to-build)
+
 ## How to use
 
 Initialize project
@@ -211,6 +219,10 @@ Generated files are kept under a profile-specific build directory:
 <dir>/build/clang-debug/
 <dir>/build/msvc-debug/
 ```
+
+For GCC and Clang builds, `bspm` also writes compiler dependency files next to
+object files and uses them for incremental rebuild checks, so changes to quoted
+or included headers rebuild the affected source files.
 
 Run executable
 ```console

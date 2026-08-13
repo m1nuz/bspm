@@ -10,6 +10,7 @@
 - Smoke coverage for CLI basics, dry-run plans, graph output, compiler selection, custom build options, and parallel builds.
 
 ### Changed
+- GCC and Clang incremental rebuilds now track compiler depfiles for included headers.
 - Improved module discovery, dependency sorting, and project build planning used by both `build` and `graph`.
 - Expanded README coverage for diagnostics, graph inspection, parallel builds, and custom build options.
 
