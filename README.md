@@ -177,6 +177,13 @@ bspm graph all
 bspm graph examples/project-config --project
 ```
 
+Generate an IDE-friendly compilation database without compiling:
+```console
+bspm compile-commands <dir>
+bspm compile-commands all
+bspm compile-commands examples/project-config --project
+```
+
 `bspm.build` uses a small shell-like syntax:
 - `project <name>` names the project.
 - `default <target>` chooses what bare `build`, `run`, and `clean` mean.
@@ -229,6 +236,7 @@ Show help
 bspm help
 bspm help build
 bspm help graph
+bspm help compile-commands
 bspm help doctor
 ```
 

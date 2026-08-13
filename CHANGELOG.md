@@ -4,6 +4,7 @@
 - `bspm doctor` to report local compiler and linker tool availability.
 - `bspm graph` to inspect discovered targets, source units, module declarations, and imports without compiling.
 - `bspm build --explain` to print the discovered source/module graph before building.
+- `bspm compile-commands` to write `compile_commands.json` for folder targets and projects.
 - Parallel compilation for independent source files through `-j` and `--jobs`.
 - User-supplied build and discovery options: `--source`, `--exclude`, `--include`, `--define`, `--cxxflag`, and `--ldflag`.
 - Smoke coverage for CLI basics, dry-run plans, graph output, compiler selection, custom build options, and parallel builds.

@@ -56,6 +56,7 @@ constexpr char CleanTag[] = "clean";
 constexpr char InitTag[] = "init";
 constexpr char DoctorTag[] = "doctor";
 constexpr char GraphTag[] = "graph";
+constexpr char CompileCommandsTag[] = "compile-commands";
 
 constexpr char GPPCompilerTag[] = "g++";
 constexpr char GCCCompilerTag[] = "gcc";
@@ -74,6 +75,7 @@ std::string_view commands[] {
     BuildTag,
     DoctorTag,
     GraphTag,
+    CompileCommandsTag,
     RunTag,
     CleanTag,
     VersionTag,
@@ -268,6 +270,18 @@ struct BuiltTargetArtifacts {
     std::unordered_map<std::string, fs::path> module_artifacts;
     std::vector<std::string> import_sys_headers;
     std::vector<std::string> import_std_modules;
+};
+
+struct CompileCommandEntry {
+    fs::path directory;
+    std::string command;
+    fs::path file;
+    fs::path output;
+};
+
+struct SourceCompilePlan {
+    std::vector<std::string> args;
+    fs::path output;
 };
 
 auto configure_target_paths(Context& context, const fs::path& source_dir) -> void;
@@ -1094,6 +1108,15 @@ auto help_command(Context& context, std::string_view command) -> void {
         std::println("\t{} {} [dir|target|all] [options]", context.name, GraphTag);
         std::println("");
         std::println("Print discovered project targets, source units, module declarations, and imports.");
+        std::println("Accepts the same build selection options as '{} {}'.", context.name, BuildTag);
+        return;
+    }
+
+    if (command == CompileCommandsTag) {
+        std::println("Usage:");
+        std::println("\t{} {} [dir|target|all] [options]", context.name, CompileCommandsTag);
+        std::println("");
+        std::println("Write compile_commands.json for a folder target or configured project.");
         std::println("Accepts the same build selection options as '{} {}'.", context.name, BuildTag);
         return;
     }
@@ -2261,6 +2284,173 @@ auto append_user_link_args(std::vector<std::string>& args, const Context& contex
     args.insert(std::end(args), std::begin(context.user_ld_flags), std::end(context.user_ld_flags));
 }
 
+auto source_compile_plan_for_unit(const Context& context, std::size_t unit_index) -> SourceCompilePlan {
+    const auto& unit = context.compile_units[unit_index];
+    const auto unit_object_path = object_path(context, unit.file_path);
+    const auto extension = unit.file_path.extension().string();
+
+    if (unit.is_importable_module_unit() && context.compiler == Compiler::Clang) {
+        SourceCompilePlan plan {
+            .args = {
+                context.cpp_standard,
+                context.cpp_flags,
+                std::string { "-xc++" },
+                std::string { "-xc++-module" },
+                std::string { "--precompile" },
+                std::string { "-Wno-experimental-header-units" },
+            },
+            .output = clang_module_pcm_path(unit.module_name),
+        };
+        append_user_compile_args(plan.args, context);
+        append_clang_unit_import_args(plan.args, context, unit, unit_index);
+        plan.args.push_back(path_arg(unit.file_path));
+        plan.args.push_back(std::string { "-o" });
+        plan.args.push_back(plan.output.generic_string());
+        return plan;
+    }
+
+    SourceCompilePlan plan {
+        .args = {
+            context.cpp_standard,
+            context.cpp_flags,
+        },
+        .output = unit_object_path,
+    };
+    append_user_compile_args(plan.args, context);
+
+    if (unit.is_importable_module_unit()) {
+        if (context.compiler == Compiler::MSVC) {
+            plan.args.push_back(std::string { "/c" });
+            plan.args.push_back(std::string { "/TP" });
+            if (unit.module_kind == ModuleUnitKind::InternalPartition) {
+                plan.args.push_back(std::string { "/internalPartition" });
+            } else {
+                plan.args.push_back(std::string { "/interface" });
+            }
+
+            append_msvc_import_args(plan.args, context, unit);
+
+            plan.args.push_back(std::string { "/ifcOutput" });
+            plan.args.push_back(msvc_module_ifc_path(unit.module_name).string());
+            plan.args.push_back(std::string { "/Fo" } + unit_object_path.string());
+            plan.args.push_back(path_arg(unit.file_path));
+        } else {
+            plan.args.push_back(std::string { "-xc++" });
+            plan.args.push_back(std::string { "-c" });
+            plan.args.push_back(path_arg(unit.file_path));
+            plan.args.push_back(std::string { "-o" });
+            plan.args.push_back(path_arg(unit_object_path));
+        }
+        return plan;
+    }
+
+    if (context.compiler == Compiler::MSVC) {
+        plan.args.push_back(std::string { "/c" });
+        plan.args.push_back(std::string { "/TP" });
+        append_msvc_import_args(plan.args, context, unit);
+        plan.args.push_back(std::string { "/Fo" } + unit_object_path.string());
+        plan.args.push_back(path_arg(unit.file_path));
+    } else if (context.compiler == Compiler::Clang) {
+        plan.args.push_back("-Wno-experimental-header-units");
+        append_clang_unit_import_args(plan.args, context, unit, unit_index);
+        append_non_msvc_source_compile_args(plan.args, unit, unit_object_path, extension);
+    } else {
+        append_non_msvc_source_compile_args(plan.args, unit, unit_object_path, extension);
+    }
+
+    return plan;
+}
+
+auto json_escape(std::string_view value) -> std::string {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char ch : value) {
+        switch (ch) {
+        case '\\':
+            escaped += "\\\\";
+            break;
+        case '"':
+            escaped += "\\\"";
+            break;
+        case '\b':
+            escaped += "\\b";
+            break;
+        case '\f':
+            escaped += "\\f";
+            break;
+        case '\n':
+            escaped += "\\n";
+            break;
+        case '\r':
+            escaped += "\\r";
+            break;
+        case '\t':
+            escaped += "\\t";
+            break;
+        default:
+            if (static_cast<unsigned char>(ch) < 0x20) {
+                std::format_to(std::back_inserter(escaped), "\\u{:04x}", static_cast<unsigned char>(ch));
+            } else {
+                escaped.push_back(ch);
+            }
+            break;
+        }
+    }
+    return escaped;
+}
+
+auto append_compile_commands(const Context& context, std::vector<CompileCommandEntry>& entries) -> bool {
+    for (std::size_t unit_index = 0; unit_index < context.compile_units.size(); ++unit_index) {
+        const auto& unit = context.compile_units[unit_index];
+        const auto plan = source_compile_plan_for_unit(context, unit_index);
+        const auto invocation = make_process_invocation(context, context.cpp_c, plan.args);
+        if (invocation.executable.empty()) {
+            return false;
+        }
+
+        entries.push_back(CompileCommandEntry {
+            .directory = context.build_dir,
+            .command = invocation.display_command,
+            .file = unit.file_path,
+            .output = plan.output.is_absolute() ? plan.output : context.build_dir / plan.output,
+        });
+    }
+
+    return true;
+}
+
+auto write_compile_commands(const fs::path& output_path, std::span<const CompileCommandEntry> entries) -> bool {
+    if (!ensure_parent_directory(output_path)) {
+        return false;
+    }
+
+    std::ofstream file { output_path };
+    if (!file) {
+        std::println("Error: failed to write '{}'", output_path.string());
+        return false;
+    }
+
+    file << "[\n";
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+        const auto& entry = entries[index];
+        file << "  {\n";
+        file << "    \"directory\": \"" << json_escape(fs::absolute(entry.directory).string()) << "\",\n";
+        file << "    \"command\": \"" << json_escape(entry.command) << "\",\n";
+        file << "    \"file\": \"" << json_escape(fs::absolute(entry.file).string()) << "\",\n";
+        file << "    \"output\": \"" << json_escape(fs::absolute(entry.output).string()) << "\"\n";
+        file << "  }" << (index + 1 == entries.size() ? "\n" : ",\n");
+    }
+    file << "]\n";
+
+    if (!file) {
+        std::println("Error: failed to write '{}'", output_path.string());
+        return false;
+    }
+
+    std::println("wrote {}", output_path.string());
+    return true;
+}
+
 auto compile_object_only_unit(Context& context, std::size_t unit_index, const CompileUnit& unit,
     const fs::path& unit_object_path, std::string_view extension) -> bool {
     std::vector<std::string> args {
@@ -3381,7 +3571,7 @@ auto init_context(Context& context, std::string_view command, const InitConfigur
     context.output_name = "a.out";
 #endif
 
-    const bool build_like_command = command == BuildTag || command == GraphTag;
+    const bool build_like_command = command == BuildTag || command == GraphTag || command == CompileCommandsTag;
 
     if (conf.argv && conf.index < conf.argc) {
         int32_t idx = conf.index;
@@ -3795,6 +3985,51 @@ auto graph_project(const ProjectConfig& project, std::span<const std::string_vie
     return true;
 }
 
+auto compile_commands_command(
+    Context& context, fs::path dir, std::vector<CompileCommandEntry>& entries) -> bool {
+    if (!prepare_build_plan(context, dir)) {
+        return false;
+    }
+
+    return append_compile_commands(context, entries);
+}
+
+auto write_single_target_compile_commands(Context& context, fs::path dir) -> bool {
+    std::vector<CompileCommandEntry> entries;
+    if (!compile_commands_command(context, dir, entries)) {
+        return false;
+    }
+
+    return write_compile_commands(context.source_dir / "compile_commands.json", entries);
+}
+
+auto compile_commands_project(const ProjectConfig& project, std::span<const std::string_view> requested_targets,
+    std::span<const std::string_view> cli_options) -> bool {
+    std::vector<const TargetConfig*> build_order;
+    if (!collect_project_build_order(project, requested_targets, build_order)) {
+        return false;
+    }
+
+    std::unordered_map<std::string, BuiltTargetArtifacts> planned_artifacts;
+    std::vector<CompileCommandEntry> entries;
+
+    for (const auto* target : build_order) {
+        Context target_context;
+        if (!create_target_context(project, *target, cli_options, target_context)) {
+            return false;
+        }
+        if (!collect_target_dependency_artifacts(project, *target, planned_artifacts, target_context)) {
+            return false;
+        }
+        if (!compile_commands_command(target_context, project.root / target->path, entries)) {
+            return false;
+        }
+        planned_artifacts[target->name] = collect_built_target_artifacts(target_context);
+    }
+
+    return write_compile_commands(project.root / "compile_commands.json", entries);
+}
+
 auto create_configured_target_context(
     const ProjectConfig& project, const TargetConfig& target, bool verbose, Context& context) -> bool {
     if (!create_target_context(project, target, {}, context)) {
@@ -4031,6 +4266,69 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         return graph_command(context, dir) ? 0 : 1;
+    }
+
+    if (command == CompileCommandsTag) {
+        fs::path dir;
+        int32_t option_index = 2;
+        if (argc > 2 && !is_option_argument(argv[2])) {
+            dir = argv[2];
+            option_index = 3;
+        }
+
+        std::vector<std::string_view> cli_options;
+        for (int32_t idx = option_index; idx < argc; ++idx) {
+            cli_options.push_back(argv[idx]);
+        }
+
+        const bool force_project = contains_option(cli_options, ProjectOptTag);
+        if (force_project) {
+            ProjectConfig explicit_project;
+            bool explicit_project_present = false;
+            const auto project_root = dir.empty() ? fs::current_path() : dir;
+            if (!load_project_config_if_present(explicit_project, explicit_project_present, project_root)) {
+                if (!explicit_project_present) {
+                    std::println(
+                        "Error: '{}' does not contain a non-empty bspm.build", fs::absolute(project_root).string());
+                }
+                return 1;
+            }
+
+            project = std::move(explicit_project);
+            project_present = true;
+        }
+
+        const auto subject = dir.generic_string();
+        const bool use_project = force_project
+            || (project_present && (dir.empty() || subject == "all" || has_project_target(project, subject)));
+        if (use_project) {
+            std::vector<std::string_view> requested_targets;
+            if (force_project) {
+                if (!project.default_target.empty()) {
+                    requested_targets.push_back(project.default_target);
+                } else {
+                    std::println("Error: project does not define a default target");
+                    return 1;
+                }
+            } else if (subject == "all") {
+                requested_targets = project_target_names(project);
+            } else if (!dir.empty()) {
+                requested_targets.push_back(subject);
+            } else if (!project.default_target.empty()) {
+                requested_targets.push_back(project.default_target);
+            } else {
+                std::println("Error: project does not define a default target");
+                return 1;
+            }
+
+            return compile_commands_project(project, requested_targets, cli_options) ? 0 : 1;
+        }
+
+        if (!init_context(context, CompileCommandsTag, { .argc = argc, .index = option_index, .argv = argv })) {
+            std::println("Type '{} help {}' for more description.", context.name, CompileCommandsTag);
+            return 1;
+        }
+        return write_single_target_compile_commands(context, dir) ? 0 : 1;
     }
 
     if (command == RunTag) {

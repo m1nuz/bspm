@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import shutil
@@ -199,6 +200,9 @@ def assert_cli_basics(bspm: Path, toolchain: Toolchain) -> None:
     graph_help_result = run([bspm, "help", "graph"])
     expect("discovered project targets" in graph_help_result.stdout, "graph help should describe graph output")
 
+    compile_commands_help_result = run([bspm, "help", "compile-commands"])
+    expect("compile_commands.json" in compile_commands_help_result.stdout, "compile-commands help should describe output")
+
     version_result = run([bspm, "version"])
     expect(version_result.stdout.startswith("bspm "), "version output should start with 'bspm '")
 
@@ -240,8 +244,24 @@ def assert_dry_run_plans(bspm: Path, workspace: Path, toolchain: Toolchain) -> N
     graph_result = run([bspm, "graph", nested, "-c", toolchain.bspm_selector])
     expect("module imports:" in graph_result.stdout, "graph should print module imports")
 
+    run([bspm, "compile-commands", nested, "-c", toolchain.bspm_selector])
+    nested_compile_commands = json.loads((nested / "compile_commands.json").read_text())
+    expect(len(nested_compile_commands) == 2, "nested compile_commands should include both source units")
+    expect(
+        any("main.cpp" in entry["file"] and toolchain.bspm_selector in entry["command"] for entry in nested_compile_commands),
+        "nested compile_commands should include the main source compile command",
+    )
+
     project_graph_result = run([bspm, "graph", project, "--project", "-c", toolchain.bspm_selector])
     expect("target order:" in project_graph_result.stdout, "project graph should print target order")
+
+    run([bspm, "compile-commands", project, "--project", "-c", toolchain.bspm_selector])
+    project_compile_commands = json.loads((project / "compile_commands.json").read_text())
+    expect(len(project_compile_commands) >= 3, "project compile_commands should include dependency and app units")
+    expect(
+        any("app" in entry["file"] and "main.cpp" in entry["file"] for entry in project_compile_commands),
+        "project compile_commands should include the app main source",
+    )
 
 
 def assert_simple_binary(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:
