@@ -2730,31 +2730,9 @@ auto compile_unit(Context& context, std::size_t unit_index) -> bool {
     return compile_object_only_unit(context, unit_index, unit, unit_object_path, extension);
 }
 
-auto compile_units(Context& context) -> bool {
-    if (context.jobs <= 1 || context.dry_run) {
-        for (std::size_t unit_index = 0; unit_index < context.compile_units.size(); ++unit_index) {
-            if (!compile_unit(context, unit_index)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    std::vector<std::size_t> parallel_units;
-    parallel_units.reserve(context.compile_units.size());
-
-    for (std::size_t unit_index = 0; unit_index < context.compile_units.size(); ++unit_index) {
-        if (context.compile_units[unit_index].is_importable_module_unit()) {
-            if (!compile_unit(context, unit_index)) {
-                return false;
-            }
-        } else {
-            parallel_units.push_back(unit_index);
-        }
-    }
-
+auto compile_unit_indices(Context& context, std::span<const std::size_t> unit_indices) -> bool {
     std::vector<std::future<bool>> pending;
-    pending.reserve(std::min(context.jobs, parallel_units.size()));
+    pending.reserve(std::min(context.jobs, unit_indices.size()));
 
     auto wait_for_oldest_job = [&]() -> bool {
         auto result = pending.front().get();
@@ -2763,7 +2741,7 @@ auto compile_units(Context& context) -> bool {
     };
 
     bool success = true;
-    for (const auto unit_index : parallel_units) {
+    for (const auto unit_index : unit_indices) {
         if (!success) {
             break;
         }
@@ -2783,6 +2761,77 @@ auto compile_units(Context& context) -> bool {
     }
 
     return success;
+}
+
+auto importable_module_unit_levels(const Context& context) -> std::vector<std::vector<std::size_t>> {
+    std::unordered_map<std::string, std::size_t> importable_module_to_unit;
+    for (std::size_t unit_index = 0; unit_index < context.compile_units.size(); ++unit_index) {
+        const auto& unit = context.compile_units[unit_index];
+        if (unit.is_importable_module_unit()) {
+            importable_module_to_unit[unit.module_name] = unit_index;
+        }
+    }
+
+    std::unordered_map<std::size_t, std::size_t> unit_to_level;
+    std::vector<std::vector<std::size_t>> levels;
+    for (std::size_t unit_index = 0; unit_index < context.compile_units.size(); ++unit_index) {
+        const auto& unit = context.compile_units[unit_index];
+        if (!unit.is_importable_module_unit()) {
+            continue;
+        }
+
+        std::size_t level = 0;
+        for (const auto& imported_module : unit.module_imports) {
+            auto dependency = importable_module_to_unit.find(imported_module);
+            if (dependency == std::end(importable_module_to_unit)) {
+                continue;
+            }
+
+            if (auto dependency_level = unit_to_level.find(dependency->second);
+                dependency_level != std::end(unit_to_level)) {
+                level = std::max(level, dependency_level->second + 1);
+            }
+        }
+
+        if (levels.size() <= level) {
+            levels.resize(level + 1);
+        }
+        levels[level].push_back(unit_index);
+        unit_to_level[unit_index] = level;
+    }
+
+    return levels;
+}
+
+auto object_only_unit_indices(const Context& context) -> std::vector<std::size_t> {
+    std::vector<std::size_t> unit_indices;
+    unit_indices.reserve(context.compile_units.size());
+    for (std::size_t unit_index = 0; unit_index < context.compile_units.size(); ++unit_index) {
+        if (!context.compile_units[unit_index].is_importable_module_unit()) {
+            unit_indices.push_back(unit_index);
+        }
+    }
+    return unit_indices;
+}
+
+auto compile_units(Context& context) -> bool {
+    if (context.jobs <= 1 || context.dry_run) {
+        for (std::size_t unit_index = 0; unit_index < context.compile_units.size(); ++unit_index) {
+            if (!compile_unit(context, unit_index)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    for (const auto& level : importable_module_unit_levels(context)) {
+        if (!compile_unit_indices(context, level)) {
+            return false;
+        }
+    }
+
+    auto object_units = object_only_unit_indices(context);
+    return compile_unit_indices(context, object_units);
 }
 
 auto build_command(Context& context, fs::path dir) -> bool {

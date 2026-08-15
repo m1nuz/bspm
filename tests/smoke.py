@@ -292,6 +292,11 @@ def assert_parallel_build(bspm: Path, workspace: Path, toolchain: Toolchain) -> 
     result = run([bspm, "run", fixture])
     expect(result.stdout.strip() == "multi-source: 7", "parallel multi-source binary should run")
 
+    module_fixture = copy_fixture("parallel-modules", workspace)
+    run(build_command(bspm, toolchain, module_fixture, "-j", "2"))
+    module_result = run([bspm, "run", module_fixture])
+    expect(module_result.stdout.strip() == "parallel-modules: 42", "parallel module levels should build and run")
+
 
 def assert_user_build_options(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:
     fixture = copy_fixture("user-options", workspace)

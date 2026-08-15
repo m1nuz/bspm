@@ -11,6 +11,7 @@
 
 ### Changed
 - GCC and Clang incremental rebuilds now track compiler depfiles for included headers.
+- Parallel builds now compile independent importable module units by dependency level.
 - Improved module discovery, dependency sorting, and project build planning used by both `build` and `graph`.
 - Expanded README coverage for diagnostics, graph inspection, parallel builds, and custom build options.
 

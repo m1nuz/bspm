@@ -125,6 +125,8 @@ Compile independent source files in parallel
 bspm build <dir> -j 4
 bspm build <dir> --jobs 4
 ```
+Importable module units are compiled in dependency levels, so independent module
+interfaces in the same level can also compile in parallel.
 
 Add compile, link, definition, include, and discovery options
 ```console
