@@ -52,8 +52,8 @@ Build project
 bspm build <dir>
 ```
 
-`bspm` scans the target directory recursively for `.cpp` and `.cppm` files, so
-targets may use nested source folders:
+`bspm` scans target directories recursively for `.cpp`, `.cc`, `.cxx`, `.c++`,
+`.cppm`, `.ixx`, and `.mpp` files, so targets may use nested source folders:
 ```text
 <dir>/
 ├── src/
@@ -204,15 +204,74 @@ bspm compile-commands examples/project-config --project
   `--depends <target>` entries.
 - Repeated `--cxxflag`, `--ldflag`, `--define`, `--include`, `--source`, and
   `--exclude` entries are allowed. Values that contain spaces can be quoted.
+- `--public-include <dir>` adds an include directory to a target and exports it
+  transitively to targets that depend on it.
 - `--source` restricts discovery to one file or directory relative to the target
   root, and `--exclude` removes matching files or directories from discovery.
 - `--depends` builds dependencies first, exposes their module artifacts to the
   consumer target, and adds library outputs to the consumer link step.
-- `#` starts a comment, and quoted paths such as `"tools/code gen"` are allowed.
+- `#` starts a comment when it begins a token, while package revisions such as
+  `12.2.0#1` remain part of their version token. Quoted paths such as
+  `"tools/code gen"` are allowed.
 
 `bspm init <dir>` keeps config out of the simple path. Use
 `bspm init <dir> --project` when you want a starter `bspm.build` file and a
 configured `app` target.
+
+## Registry packages
+
+Configured projects can consume exact, source-based packages from the central
+[`bspm-registry`](https://github.com/m1nuz/bspm-registry) or a local registry.
+Declare requirements in the project's `bspm.deps` file:
+
+```text
+# Uses the central registry baseline.
+require fmt
+
+# Or pin the upstream and package-recipe versions explicitly.
+require fmt 12.2.0#0
+```
+
+To use another Git registry or a local registry checkout, add one `registry`
+directive before the requirements:
+
+```text
+registry ../my-registry
+require answer 1.0.0#0
+```
+
+Registry packages expose namespaced targets. A consumer opts into the target in
+`bspm.build`:
+
+```text
+project demo
+default app
+
+target app app --bin -o demo --depends fmt::fmt
+```
+
+When `build`, `graph`, or `compile-commands` plans the project, `bspm` resolves
+baseline or exact versions, validates `package.bspm`, checks out its full Git
+`source-revision`, loads either its source-owned or registry-owned build recipe,
+and adds the recipe targets to the normal project dependency graph. Package
+sources and their build outputs are cached under `.bspm/packages/`; a remote
+registry is cached under `.bspm/registry/`. Git is required when a package source
+or registry must be fetched.
+
+After the first successful resolution, `bspm` writes `bspm.lock`. The lockfile
+pins the registry Git commit, every exact `version#package-revision`, and every
+package source commit. Later `build`, `graph`, and `compile-commands` operations
+restore and validate those revisions before using the registry. Commit both
+`bspm.deps` and `bspm.lock`, but ignore `.bspm/`; newly initialized projects
+receive an appropriate `.gitignore` automatically. `bspm init` creates
+`bspm.deps`, but deliberately waits for a successful resolution before creating
+`bspm.lock`.
+
+The initial resolver accepts exact versions only. If requirements or the
+registry selection change, remove `bspm.lock` to resolve again; a dedicated
+update command is not yet implemented. Version ranges, archive sources, and
+binary packages are also not yet implemented. Registry recipes may use a
+trailing `\` to continue a directive on the next line.
 
 Generated files are kept under a profile-specific build directory:
 ```text

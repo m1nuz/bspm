@@ -133,6 +133,52 @@ def copy_fixture(name: str, workspace: Path, *, suffix: str = "") -> Path:
     return destination
 
 
+def create_registry_package_fixture(workspace: Path, *, suffix: str = "") -> Path:
+    source = workspace / f"answer-package-source{suffix}"
+    (source / "include").mkdir(parents=True)
+    (source / "src").mkdir()
+    (source / "include" / "answer.hpp").write_text("int answer();\n")
+    (source / "src" / "answer.cc").write_text('#include <answer.hpp>\n\nint answer() { return 42; }\n')
+
+    run(["git", "init"], cwd=source)
+    run(["git", "config", "user.name", "bspm smoke"], cwd=source)
+    run(["git", "config", "user.email", "bspm-smoke@example.invalid"], cwd=source)
+    run(["git", "add", "."], cwd=source)
+    run(["git", "commit", "-m", "Create answer package"], cwd=source)
+    revision = run(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
+
+    registry = workspace / f"test-registry{suffix}"
+    package = registry / "packages" / "answer" / "1.0.0"
+    package.mkdir(parents=True)
+    (registry / "registry.bspm").write_text("registry smoke\nformat 1\n")
+    (registry / "baseline.bspm").write_text("package answer 1.0.0#0\n")
+    (package / "package.bspm").write_text(
+        "package answer\n"
+        "version 1.0.0\n"
+        "package-revision 0\n\n"
+        f'source git "{source.as_posix()}"\n'
+        f"source-revision {revision}\n\n"
+        "build registry build.bspm\n"
+    )
+    (package / "build.bspm").write_text(
+        "project answer\n"
+        "default answer\n\n"
+        "target answer . --lib -o answer \\\n"
+        "    --source src/answer.cc \\\n"
+        "    --public-include include\n"
+    )
+
+    run(["git", "init"], cwd=registry)
+    run(["git", "config", "user.name", "bspm smoke"], cwd=registry)
+    run(["git", "config", "user.email", "bspm-smoke@example.invalid"], cwd=registry)
+    run(["git", "add", "."], cwd=registry)
+    run(["git", "commit", "-m", "Create test registry"], cwd=registry)
+
+    consumer = copy_fixture("package-consumer", workspace, suffix=suffix)
+    (consumer / "bspm.deps").write_text(f'registry "{registry.as_uri()}"\nrequire answer\n')
+    return consumer
+
+
 def build_bspm(workspace: Path, toolchain: Toolchain) -> Path:
     executable = workspace / f"bspm{toolchain.executable_suffix}"
 
@@ -180,12 +226,16 @@ def build_command(bspm: Path, toolchain: Toolchain, *args: object) -> list[objec
 def assert_generated_project_scaffolds(bspm: Path, workspace: Path) -> None:
     simple = workspace / "generated-simple"
     run([bspm, "init", simple])
-    expect((simple / ".dependencies").is_file(), "plain init should create .dependencies")
+    expect((simple / "bspm.deps").is_file(), "plain init should create bspm.deps")
+    expect(not (simple / "bspm.lock").exists(), "plain init should not create an unresolved lockfile")
+    expect(".bspm/" in (simple / ".gitignore").read_text(), "plain init should ignore package caches")
     expect((simple / "main.cpp").is_file(), "plain init should create main.cpp")
 
     project = workspace / "generated-project"
     run([bspm, "init", project, "--project"])
-    expect((project / ".dependencies").is_file(), "project init should create .dependencies")
+    expect((project / "bspm.deps").is_file(), "project init should create bspm.deps")
+    expect(not (project / "bspm.lock").exists(), "project init should not create an unresolved lockfile")
+    expect(".bspm/" in (project / ".gitignore").read_text(), "project init should ignore package caches")
     expect((project / "bspm.build").is_file(), "project init should create bspm.build")
     expect((project / "app" / "main.cpp").is_file(), "project init should create app/main.cpp")
 
@@ -264,6 +314,54 @@ def assert_dry_run_plans(bspm: Path, workspace: Path, toolchain: Toolchain) -> N
         any("app" in entry["file"] and "main.cpp" in entry["file"] for entry in project_compile_commands),
         "project compile_commands should include the app main source",
     )
+
+    package_consumer = create_registry_package_fixture(workspace, suffix="-dry-run")
+    package_result = run(build_command(bspm, toolchain, package_consumer, "--project", "--dry-run"))
+    expect("answer.cc" in package_result.stdout, "package dry-run should compile the registry target")
+    expect("include" in package_result.stdout, "package public includes should propagate to the consumer")
+    lock_path = package_consumer / "bspm.lock"
+    expect(lock_path.is_file(), "successful package resolution should create bspm.lock")
+    lock_contents = lock_path.read_text()
+    expect(lock_contents.startswith("format 1\nregistry "), "bspm.lock should declare its format and registry")
+    expect("package answer 1.0.0#0 " in lock_contents, "bspm.lock should pin the package recipe")
+
+    registry = workspace / "test-registry-dry-run"
+    locked_registry_revision = run(["git", "rev-parse", "HEAD"], cwd=registry).stdout.strip()
+    expect(locked_registry_revision in lock_contents, "bspm.lock should pin the registry commit")
+    (registry / "baseline.bspm").write_text("package answer 2.0.0#0\n")
+    run(["git", "add", "baseline.bspm"], cwd=registry)
+    run(["git", "commit", "-m", "Move test baseline"], cwd=registry)
+    (package_consumer / ".bspm" / "registry").rename(package_consumer / ".bspm" / "registry-before-lock")
+
+    package_graph = run([bspm, "graph", package_consumer, "--project", "-c", toolchain.bspm_selector])
+    expect("target order: answer::answer app" in package_graph.stdout, "package target should precede its consumer")
+    cached_registry_revision = run(
+        ["git", "rev-parse", "HEAD"], cwd=package_consumer / ".bspm" / "registry"
+    ).stdout.strip()
+    expect(cached_registry_revision == locked_registry_revision, "bspm.lock should restore the pinned registry commit")
+
+    run([bspm, "compile-commands", package_consumer, "--project", "-c", toolchain.bspm_selector])
+    package_compile_commands = json.loads((package_consumer / "compile_commands.json").read_text())
+    expect(
+        any("answer.cc" in entry["file"] for entry in package_compile_commands),
+        "package compile_commands should include registry target sources",
+    )
+
+    dependencies_path = package_consumer / "bspm.deps"
+    dependencies_path.write_text(dependencies_path.read_text().replace("require answer", "require answer 1.0.0#1"))
+    revision_result = run(
+        build_command(bspm, toolchain, package_consumer, "--project", "--dry-run"),
+        expected=1,
+    )
+    expect("bspm.lock is out of date" in revision_result.stdout, "package recipe revisions should be exact")
+
+    dependencies_path.write_text(dependencies_path.read_text().replace("require answer 1.0.0#1", "require answer"))
+    lock_path.unlink()
+    refresh_result = run(
+        build_command(bspm, toolchain, package_consumer, "--project", "--dry-run"),
+        expected=1,
+    )
+    expect("2.0.0" in refresh_result.stdout, "resolving without a lock should use the latest registry baseline")
 
 
 def assert_simple_binary(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:
@@ -391,6 +489,18 @@ def assert_project_build_run_and_clean(bspm: Path, workspace: Path, toolchain: T
     expect(not (fixture / "app" / "build").exists(), "clean all should remove app build dir")
 
 
+def assert_registry_package_build(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:
+    fixture = create_registry_package_fixture(workspace)
+    run(build_command(bspm, toolchain, fixture, "--project"))
+    incremental_result = run(build_command(bspm, toolchain, fixture, "--project", "-v"))
+    expect(
+        "up to date: src/answer.cc" in incremental_result.stdout,
+        "cached package sources should build incrementally",
+    )
+    result = run([bspm, "run"], cwd=fixture)
+    expect(result.stdout.strip() == "package-consumer: 42", "registry package should build, link, and run")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run bspm smoke coverage.")
     parser.add_argument("--toolchain", choices=("gcc", "clang", "msvc"), default="gcc")
@@ -418,6 +528,7 @@ def main() -> int:
             assert_user_build_options(bspm, workspace, toolchain)
             assert_library_outputs(bspm, workspace, toolchain)
             assert_project_build_run_and_clean(bspm, workspace, toolchain)
+            assert_registry_package_build(bspm, workspace, toolchain)
 
     print(f"{toolchain.name} {level} smoke tests passed")
     return 0

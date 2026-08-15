@@ -1,3 +1,16 @@
+## Unreleased
+
+### Added
+- Exact-version packages from the central or a local Git registry through `bspm.deps`.
+- Deterministic `bspm.lock` generation that pins the registry commit, package recipe revisions, and source commits.
+- Registry and source build recipes imported as namespaced `package::target` dependencies.
+- Git source caching under `.bspm/packages` and baseline resolution from `baseline.bspm`.
+- `.gitignore` scaffolding for generated `build/` and `.bspm/` caches.
+- `--public-include` usage requirements propagated transitively to consuming targets.
+- Backslash line continuations in `bspm.build` and registry recipes.
+- C++ source discovery for `.cc`, `.cxx`, and `.c++`, plus `.ixx` and `.mpp` module interfaces.
+- Offline smoke coverage for registry resolution, source checkout, public includes, compilation databases, and linking.
+
 ## [0.0.6] - 2026-08-12
 
 ### Added
