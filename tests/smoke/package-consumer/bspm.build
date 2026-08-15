@@ -1,0 +1,4 @@
+project package-consumer
+default app
+
+target app app --bin -o package-consumer --depends answer::answer

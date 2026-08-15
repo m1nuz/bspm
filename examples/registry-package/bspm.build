@@ -1,0 +1,4 @@
+project registry-package
+default app
+
+target app app --bin -o registry-package --depends fmt::fmt

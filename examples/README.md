@@ -13,6 +13,7 @@ capability. Automated smoke coverage lives separately under `tests/`.
 | `shared-library` | Shared library target | `bspm build examples/shared-library --shared -o greeting` | Not runnable |
 | `project-config` | Optional `bspm.build` project config with cross-target module and link dependency consumption | `cd examples/project-config && bspm build` | `cd examples/project-config && bspm run` |
 | `module-partitions` | Primary interface, exported partition, internal partition, and implementation unit | `bspm build examples/module-partitions` | `bspm run examples/module-partitions` |
+| `registry-package` | Exact central-registry dependency, namespaced target, and public include propagation | `bspm build examples/registry-package --project` | `cd examples/registry-package && bspm run` |
 
 ## Notes
 
@@ -38,4 +39,9 @@ capability. Automated smoke coverage lives separately under `tests/`.
   detail.cppm  module math:detail;
   math.cpp     module math;
   ```
+- `registry-package` resolves `fmt 12.2.0#0` through `bspm.deps`, writes a
+  reproducible `bspm.lock`, caches its pinned Git source under `.bspm/`, and
+  links the registry's `fmt::fmt`
+  target into the example application. Its first build requires Git and network
+  access.
 - Generated files are written under each target's `build/` directory.
