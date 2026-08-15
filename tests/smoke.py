@@ -248,8 +248,9 @@ def assert_dry_run_plans(bspm: Path, workspace: Path, toolchain: Toolchain) -> N
     run([bspm, "compile-commands", nested, "-c", toolchain.bspm_selector])
     nested_compile_commands = json.loads((nested / "compile_commands.json").read_text())
     expect(len(nested_compile_commands) == 2, "nested compile_commands should include both source units")
+    compile_driver = "cl" if toolchain.name == "msvc" else toolchain.bspm_selector
     expect(
-        any("main.cpp" in entry["file"] and toolchain.bspm_selector in entry["command"] for entry in nested_compile_commands),
+        any("main.cpp" in entry["file"] and compile_driver in entry["command"] for entry in nested_compile_commands),
         "nested compile_commands should include the main source compile command",
     )
 
