@@ -133,12 +133,17 @@ def copy_fixture(name: str, workspace: Path, *, suffix: str = "") -> Path:
     return destination
 
 
-def create_registry_package_fixture(workspace: Path, *, suffix: str = "") -> Path:
+def create_registry_package_fixture(
+    workspace: Path,
+    *,
+    suffix: str = "",
+    declare_package_default: bool = True,
+) -> Path:
     source = workspace / f"answer-package-source{suffix}"
     (source / "include").mkdir(parents=True)
     (source / "src").mkdir()
-    (source / "include" / "answer.hpp").write_text("int answer();\n")
-    (source / "src" / "answer.cc").write_text('#include <answer.hpp>\n\nint answer() { return 42; }\n')
+    (source / "include" / "answer.hpp").write_text("constexpr int answer_offset() { return 0; }\n")
+    (source / "src" / "answer.cppm").write_text("export module answer;\n\nexport int answer() { return 42; }\n")
 
     run(["git", "init"], cwd=source)
     run(["git", "config", "user.name", "bspm smoke"], cwd=source)
@@ -152,20 +157,25 @@ def create_registry_package_fixture(workspace: Path, *, suffix: str = "") -> Pat
     package.mkdir(parents=True)
     (registry / "registry.bspm").write_text("registry smoke\nformat 1\n")
     (registry / "baseline.bspm").write_text("package answer 1.0.0#0\n")
-    (package / "package.bspm").write_text(
+    package_metadata = (
         "package answer\n"
         "version 1.0.0\n"
         "package-revision 0\n\n"
         f'source git "{source.as_posix()}"\n'
         f"source-revision {revision}\n\n"
-        "build registry build.bspm\n"
+        "build registry build.bspm\n\n"
     )
+    if declare_package_default:
+        package_metadata += "default-target answer\n"
+    package_metadata += "export-target answer\n"
+    (package / "package.bspm").write_text(package_metadata)
     (package / "build.bspm").write_text(
         "project answer\n"
         "default answer\n\n"
         "target answer . --lib -o answer \\\n"
-        "    --source src/answer.cc \\\n"
+        "    --source src/answer.cppm \\\n"
         "    --public-include include\n"
+        "target private . --lib -o answer-private --source src/answer.cppm\n"
     )
 
     run(["git", "init"], cwd=registry)
@@ -177,6 +187,98 @@ def create_registry_package_fixture(workspace: Path, *, suffix: str = "") -> Pat
     consumer = copy_fixture("package-consumer", workspace, suffix=suffix)
     (consumer / "bspm.deps").write_text(f'registry "{registry.as_uri()}"\nrequire answer\n')
     return consumer
+
+
+def create_implicit_registry_package_fixture(workspace: Path, *, suffix: str = "") -> Path:
+    consumer = create_registry_package_fixture(workspace, suffix=suffix, declare_package_default=False)
+    (consumer / "bspm.build").unlink()
+    shutil.move(consumer / "app" / "main.cpp", consumer / "main.cpp")
+    (consumer / "app").rmdir()
+
+    registry_line = (consumer / "bspm.deps").read_text().splitlines()[0]
+    (consumer / "bspm.deps").write_text(f"{registry_line}\n")
+    return consumer
+
+
+def write_semver_registry_package(
+    registry: Path,
+    source: Path,
+    source_revision: str,
+    name: str,
+    version: str,
+    requirements: list[tuple[str, str]],
+) -> None:
+    package = registry / "packages" / name / version
+    package.mkdir(parents=True)
+    requirement_lines = "".join(f"require {dependency} {constraint}\n" for dependency, constraint in requirements)
+    (package / "package.bspm").write_text(
+        f"package {name}\n"
+        f"version {version}\n"
+        "package-revision 0\n\n"
+        f'source git "{source.as_posix()}"\n'
+        f"source-revision {source_revision}\n\n"
+        "build registry build.bspm\n\n"
+        "default-target core\n"
+        "export-target core\n"
+        f"{requirement_lines}"
+    )
+    (package / "build.bspm").write_text(
+        f"project {name}\n"
+        "default core\n\n"
+        f"target core . --lib -o {name} --source src/package.cpp --public-include include\n"
+    )
+
+
+def create_semver_registry_fixture(workspace: Path) -> tuple[Path, Path, Path, str]:
+    source = workspace / "semver-package-source"
+    (source / "src").mkdir(parents=True)
+    (source / "include").mkdir()
+    (source / "src" / "package.cpp").write_text("int semver_package_value() { return 1; }\n")
+    (source / "include" / "package.hpp").write_text("int semver_package_value();\n")
+    run(["git", "init"], cwd=source)
+    run(["git", "config", "user.name", "bspm smoke"], cwd=source)
+    run(["git", "config", "user.email", "bspm-smoke@example.invalid"], cwd=source)
+    run(["git", "add", "."], cwd=source)
+    run(["git", "commit", "-m", "Create semantic-version package source"], cwd=source)
+    source_revision = run(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
+
+    registry = workspace / "semver-registry"
+    registry.mkdir()
+    (registry / "registry.bspm").write_text("registry semver-smoke\nformat 1\n")
+    (registry / "baseline.bspm").write_text(
+        "package addon 2.0.0#0\n"
+        "package chooser 2.0.0#0\n"
+        "package leaf 1.5.0#0\n"
+        "package narrow 1.0.0#0\n"
+        "package right 1.0.0#0\n"
+    )
+
+    for version in ("1.0.0", "1.5.0", "1.9.0", "2.0.0"):
+        write_semver_registry_package(registry, source, source_revision, "leaf", version, [])
+    write_semver_registry_package(registry, source, source_revision, "chooser", "1.0.0", [("leaf", "^1.0.0")])
+    write_semver_registry_package(registry, source, source_revision, "chooser", "2.0.0", [("leaf", "^2.0.0")])
+    write_semver_registry_package(registry, source, source_revision, "right", "1.0.0", [("leaf", "^1.5.0")])
+    write_semver_registry_package(registry, source, source_revision, "narrow", "1.0.0", [("leaf", "~1.5.0")])
+    write_semver_registry_package(registry, source, source_revision, "narrow", "2.0.0", [("leaf", "^2.0.0")])
+    for version in ("1.0.0", "1.2.0", "2.0.0"):
+        write_semver_registry_package(registry, source, source_revision, "addon", version, [])
+
+    run(["git", "init"], cwd=registry)
+    run(["git", "config", "user.name", "bspm smoke"], cwd=registry)
+    run(["git", "config", "user.email", "bspm-smoke@example.invalid"], cwd=registry)
+    run(["git", "add", "."], cwd=registry)
+    run(["git", "commit", "-m", "Create semantic-version registry"], cwd=registry)
+
+    consumer = workspace / "semver-consumer"
+    consumer.mkdir()
+    (consumer / "main.cpp").write_text("int main() { return 0; }\n")
+    (consumer / "bspm.deps").write_text(
+        f'registry "{registry.as_uri()}"\n'
+        "require chooser >=1.0.0 <3.0.0\n"
+        "require right ^1.0.0\n"
+        "require narrow ^1.0.0\n"
+    )
+    return consumer, registry, source, source_revision
 
 
 def build_bspm(workspace: Path, toolchain: Toolchain) -> Path:
@@ -254,6 +356,18 @@ def assert_cli_basics(bspm: Path, toolchain: Toolchain) -> None:
     compile_commands_help_result = run([bspm, "help", "compile-commands"])
     expect("compile_commands.json" in compile_commands_help_result.stdout, "compile-commands help should describe output")
 
+    install_help_result = run([bspm, "help", "install"])
+    expect("bspm.lock" in install_help_result.stdout, "install help should describe locked installation")
+
+    update_help_result = run([bspm, "help", "update"])
+    expect("[package]" in update_help_result.stdout, "update help should describe selective updates")
+
+    add_help_result = run([bspm, "help", "add"])
+    expect("<package> [constraint]" in add_help_result.stdout, "add help should describe package constraints")
+
+    remove_help_result = run([bspm, "help", "remove"])
+    expect("prune" in remove_help_result.stdout, "remove help should describe lockfile pruning")
+
     version_result = run([bspm, "version"])
     expect(version_result.stdout.startswith("bspm "), "version output should start with 'bspm '")
 
@@ -316,25 +430,77 @@ def assert_dry_run_plans(bspm: Path, workspace: Path, toolchain: Toolchain) -> N
     )
 
     package_consumer = create_registry_package_fixture(workspace, suffix="-dry-run")
-    package_result = run(build_command(bspm, toolchain, package_consumer, "--project", "--dry-run"))
-    expect("answer.cc" in package_result.stdout, "package dry-run should compile the registry target")
-    expect("include" in package_result.stdout, "package public includes should propagate to the consumer")
+    registry = workspace / "test-registry-dry-run"
+    stable_package = registry / "packages" / "stable" / "1.0.0"
+    shutil.copytree(registry / "packages" / "answer" / "1.0.0", stable_package)
+    stable_metadata = stable_package / "package.bspm"
+    stable_metadata.write_text(stable_metadata.read_text().replace("package answer", "package stable", 1))
+    (registry / "baseline.bspm").write_text(
+        "package answer 1.0.0#0\n"
+        "package stable 1.0.0#0\n"
+    )
+    dependencies_path = package_consumer / "bspm.deps"
+    dependencies_path.write_text(dependencies_path.read_text() + "# keep this dependency comment\n")
+    run(["git", "add", "baseline.bspm", "packages/stable"], cwd=registry)
+    run(["git", "commit", "-m", "Add stable test package"], cwd=registry)
+
+    add_result = run([bspm, "add", "stable", "1.0.0#0", "-C", package_consumer])
+    expect("added 'stable 1.0.0#0'" in add_result.stdout, "add should report the exact direct requirement")
+    expect("# keep this dependency comment" in dependencies_path.read_text(), "add should preserve manifest comments")
+    expect("require stable 1.0.0#0" in dependencies_path.read_text(), "add should append the requirement")
     lock_path = package_consumer / "bspm.lock"
+    expect(lock_path.is_file(), "add should resolve dependencies and create bspm.lock")
+
+    manifest_after_add = dependencies_path.read_text()
+    lock_after_add = lock_path.read_text()
+    duplicate_add_result = run([bspm, "add", "stable", "-C", package_consumer], expected=1)
+    expect("already a direct requirement" in duplicate_add_result.stdout, "add should reject duplicate requirements")
+    expect(dependencies_path.read_text() == manifest_after_add, "duplicate add should preserve bspm.deps")
+    expect(lock_path.read_text() == lock_after_add, "duplicate add should preserve bspm.lock")
+
+    missing_add_result = run([bspm, "add", "missing", "-C", package_consumer], expected=1)
+    expect("no requested version or registry baseline" in missing_add_result.stdout, "failed add should report resolution errors")
+    expect(dependencies_path.read_text() == manifest_after_add, "failed add should roll back bspm.deps")
+    expect(lock_path.read_text() == lock_after_add, "failed add should preserve bspm.lock")
+
+    package_result = run(build_command(bspm, toolchain, package_consumer, "--project", "--dry-run"))
+    expect("answer.cppm" in package_result.stdout, "package dry-run should compile the registry module target")
+    expect("include" in package_result.stdout, "package public includes should propagate to the consumer")
     expect(lock_path.is_file(), "successful package resolution should create bspm.lock")
     lock_contents = lock_path.read_text()
     expect(lock_contents.startswith("format 1\nregistry "), "bspm.lock should declare its format and registry")
     expect("package answer 1.0.0#0 " in lock_contents, "bspm.lock should pin the package recipe")
+    stable_lock_line = next(line for line in lock_contents.splitlines() if line.startswith("package stable "))
 
-    registry = workspace / "test-registry-dry-run"
     locked_registry_revision = run(["git", "rev-parse", "HEAD"], cwd=registry).stdout.strip()
     expect(locked_registry_revision in lock_contents, "bspm.lock should pin the registry commit")
-    (registry / "baseline.bspm").write_text("package answer 2.0.0#0\n")
+    (registry / "baseline.bspm").write_text(
+        "package answer 2.0.0#0\n"
+        "package stable 1.0.0#0\n"
+    )
     run(["git", "add", "baseline.bspm"], cwd=registry)
     run(["git", "commit", "-m", "Move test baseline"], cwd=registry)
     (package_consumer / ".bspm" / "registry").rename(package_consumer / ".bspm" / "registry-before-lock")
 
+    install_result = run([bspm, "install", "-C", package_consumer])
+    expect("installed dependencies" in install_result.stdout, "install should report successful materialization")
+    expect(lock_path.read_text() == lock_contents, "install should preserve an existing lockfile")
+
     package_graph = run([bspm, "graph", package_consumer, "--project", "-c", toolchain.bspm_selector])
     expect("target order: answer::answer app" in package_graph.stdout, "package target should precede its consumer")
+
+    consumer_manifest = package_consumer / "bspm.build"
+    shorthand_manifest = consumer_manifest.read_text()
+    consumer_manifest.write_text(shorthand_manifest.replace("@answer", "answer::answer"))
+    explicit_graph = run([bspm, "graph", package_consumer, "--project", "-c", toolchain.bspm_selector])
+    expect("target order: answer::answer app" in explicit_graph.stdout, "explicit package targets should remain supported")
+    consumer_manifest.write_text(shorthand_manifest.replace("@answer", "answer::private"))
+    private_result = run(
+        [bspm, "graph", package_consumer, "--project", "-c", toolchain.bspm_selector],
+        expected=1,
+    )
+    expect("unexported package target 'answer::private'" in private_result.stdout, "private package targets should be rejected")
+    consumer_manifest.write_text(shorthand_manifest)
     cached_registry_revision = run(
         ["git", "rev-parse", "HEAD"], cwd=package_consumer / ".bspm" / "registry"
     ).stdout.strip()
@@ -343,11 +509,40 @@ def assert_dry_run_plans(bspm: Path, workspace: Path, toolchain: Toolchain) -> N
     run([bspm, "compile-commands", package_consumer, "--project", "-c", toolchain.bspm_selector])
     package_compile_commands = json.loads((package_consumer / "compile_commands.json").read_text())
     expect(
-        any("answer.cc" in entry["file"] for entry in package_compile_commands),
-        "package compile_commands should include registry target sources",
+        any("answer.cppm" in entry["file"] for entry in package_compile_commands),
+        "package compile_commands should include registry module sources",
     )
 
-    dependencies_path = package_consumer / "bspm.deps"
+    version_one = registry / "packages" / "answer" / "1.0.0"
+    version_two = registry / "packages" / "answer" / "2.0.0"
+    shutil.copytree(version_one, version_two)
+    package_metadata = version_two / "package.bspm"
+    package_metadata.write_text(
+        package_metadata.read_text().replace("version 1.0.0", "version 2.0.0") + "require helper\n"
+    )
+    helper_package = registry / "packages" / "helper" / "1.0.0"
+    shutil.copytree(version_one, helper_package)
+    helper_metadata = helper_package / "package.bspm"
+    helper_metadata.write_text(helper_metadata.read_text().replace("package answer", "package helper", 1))
+    (registry / "baseline.bspm").write_text(
+        "package answer 2.0.0#0\n"
+        "package helper 1.0.0#0\n"
+        "package stable 1.0.0#0\n"
+    )
+    run(["git", "add", "baseline.bspm", "packages/answer/2.0.0", "packages/helper"], cwd=registry)
+    run(["git", "commit", "-m", "Publish answer 2.0.0"], cwd=registry)
+
+    named_update_result = run([bspm, "update", "answer", "-C", package_consumer])
+    expect("updated 'answer'" in named_update_result.stdout, "named update should report its package closure")
+    named_lock_contents = lock_path.read_text()
+    expect("package answer 2.0.0#0 " in named_lock_contents, "named update should select the latest baseline")
+    expect("package helper 1.0.0#0 " in named_lock_contents, "named update should include new transitive packages")
+    expect(stable_lock_line in named_lock_contents, "named update should preserve unrelated locked packages")
+
+    missing_update_result = run([bspm, "update", "missing", "-C", package_consumer], expected=1)
+    expect("not a direct requirement" in missing_update_result.stdout, "named updates should require a direct dependency")
+    expect(lock_path.read_text() == named_lock_contents, "a failed named update should preserve bspm.lock")
+
     dependencies_path.write_text(dependencies_path.read_text().replace("require answer", "require answer 1.0.0#1"))
     revision_result = run(
         build_command(bspm, toolchain, package_consumer, "--project", "--dry-run"),
@@ -356,12 +551,88 @@ def assert_dry_run_plans(bspm: Path, workspace: Path, toolchain: Toolchain) -> N
     expect("bspm.lock is out of date" in revision_result.stdout, "package recipe revisions should be exact")
 
     dependencies_path.write_text(dependencies_path.read_text().replace("require answer 1.0.0#1", "require answer"))
-    lock_path.unlink()
-    refresh_result = run(
-        build_command(bspm, toolchain, package_consumer, "--project", "--dry-run"),
-        expected=1,
+    lock_path.write_text("not a lock\n")
+    full_update_result = run([bspm, "update", "-C", package_consumer])
+    expect("updated all dependencies" in full_update_result.stdout, "full update should report success")
+    expect(
+        "package answer 2.0.0#0 " in lock_path.read_text(),
+        "full update should atomically replace an invalid old lockfile",
     )
-    expect("2.0.0" in refresh_result.stdout, "resolving without a lock should use the latest registry baseline")
+
+    alternate_registry = workspace / "alternate-test-registry-dry-run"
+    shutil.copytree(registry, alternate_registry, ignore=shutil.ignore_patterns(".git"))
+    run(["git", "init"], cwd=alternate_registry)
+    run(["git", "config", "user.name", "bspm smoke"], cwd=alternate_registry)
+    run(["git", "config", "user.email", "bspm-smoke@example.invalid"], cwd=alternate_registry)
+    run(["git", "add", "."], cwd=alternate_registry)
+    run(["git", "commit", "-m", "Create alternate test registry"], cwd=alternate_registry)
+    dependencies_path.write_text(dependencies_path.read_text().replace(registry.as_uri(), alternate_registry.as_uri()))
+    run([bspm, "update", "-C", package_consumer])
+    expect(
+        f"registry {alternate_registry.as_uri()} " in lock_path.read_text(),
+        "full update should safely switch the cached registry origin",
+    )
+
+    manifest_before_failed_remove = dependencies_path.read_text()
+    lock_before_failed_remove = lock_path.read_text()
+    failed_remove_result = run([bspm, "remove", "answer", "-C", package_consumer], expected=1)
+    expect("unknown package alias '@answer'" in failed_remove_result.stdout, "remove should validate project consumers")
+    expect(dependencies_path.read_text() == manifest_before_failed_remove, "failed remove should restore bspm.deps")
+    expect(lock_path.read_text() == lock_before_failed_remove, "failed remove should preserve bspm.lock")
+
+    dependencies_path.write_text(
+        dependencies_path.read_text().replace(
+            "require stable 1.0.0#0\n",
+            "require \\\n    stable 1.0.0#0 # remove this logical directive\n",
+        )
+    )
+    remove_result = run([bspm, "remove", "stable", "-C", package_consumer])
+    expect("removed 'stable'" in remove_result.stdout, "remove should report the removed requirement")
+    expect("stable" not in dependencies_path.read_text(), "remove should delete a continued requirement")
+    expect("# keep this dependency comment" in dependencies_path.read_text(), "remove should preserve unrelated comments")
+    expect("package stable " not in lock_path.read_text(), "remove should prune the package from bspm.lock")
+    expect("package helper 1.0.0#0 " in lock_path.read_text(), "remove should retain reachable transitive packages")
+
+    implicit_consumer = create_implicit_registry_package_fixture(workspace, suffix="-implicit-dry-run")
+    implicit_add = run([bspm, "add", "answer"], cwd=implicit_consumer)
+    expect("added 'answer'" in implicit_add.stdout, "add should support simple projects without bspm.build")
+    expect("require answer" in (implicit_consumer / "bspm.deps").read_text(), "add should update the simple manifest")
+    expect((implicit_consumer / "bspm.lock").is_file(), "add should lock simple-project dependencies")
+
+    (implicit_consumer / ".bspm" / "should-not-build.cpp").write_text("int package_cache_probe;\n")
+
+    implicit_build = run(
+        [bspm, "build", "--dry-run", "-c", toolchain.bspm_selector],
+        cwd=implicit_consumer,
+    )
+    expect("answer.cppm" in implicit_build.stdout, "simple builds should plan their package default targets")
+    expect("main.cpp" in implicit_build.stdout, "simple builds should retain their implicit application target")
+    expect(
+        "should-not-build.cpp" not in implicit_build.stdout,
+        "simple source discovery should exclude the package cache",
+    )
+
+    implicit_graph = run([bspm, "graph", "-c", toolchain.bspm_selector], cwd=implicit_consumer)
+    expect(
+        "target order: answer::answer app" in implicit_graph.stdout,
+        "simple dependency targets should precede the implicit app",
+    )
+
+    run([bspm, "compile-commands", "-c", toolchain.bspm_selector], cwd=implicit_consumer)
+    implicit_compile_commands = json.loads((implicit_consumer / "compile_commands.json").read_text())
+    expect(
+        any("answer.cppm" in entry["file"] for entry in implicit_compile_commands),
+        "simple compile_commands should include package targets",
+    )
+    expect(
+        any(entry["file"].endswith("main.cpp") for entry in implicit_compile_commands),
+        "simple compile_commands should include the implicit app",
+    )
+
+    implicit_remove = run([bspm, "remove", "answer"], cwd=implicit_consumer)
+    expect("removed 'answer'" in implicit_remove.stdout, "remove should support simple projects")
+    expect("require answer" not in (implicit_consumer / "bspm.deps").read_text(), "remove should update the manifest")
+    expect(not (implicit_consumer / "bspm.lock").exists(), "removing the last simple dependency should prune the lock")
 
 
 def assert_simple_binary(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:
@@ -376,6 +647,95 @@ def assert_simple_binary(bspm: Path, workspace: Path, toolchain: Toolchain) -> N
     run(build_command(bspm, toolchain, spaced_fixture))
     spaced_result = run([bspm, "run", spaced_fixture])
     expect(spaced_result.stdout.strip() == "simple-bin: ok", "simple binary should build and run from a path with spaces")
+
+
+def assert_semantic_version_resolution(bspm: Path, workspace: Path) -> None:
+    consumer, registry, source, source_revision = create_semver_registry_fixture(workspace)
+    lock_path = consumer / "bspm.lock"
+    dependencies_path = consumer / "bspm.deps"
+
+    run([bspm, "update", "-C", consumer])
+    lock_contents = lock_path.read_text()
+    expect(
+        "package chooser 1.0.0#0 " in lock_contents,
+        "the solver should backtrack from the newest incompatible root package",
+    )
+    expect("package right 1.0.0#0 " in lock_contents, "caret constraints should select a compatible root")
+    expect(
+        "package leaf 1.5.0#0 " in lock_contents,
+        "intersected caret and tilde constraints should select the highest compatible leaf",
+    )
+
+    add_result = run([bspm, "add", "addon", "^1.0.0", "-C", consumer])
+    expect("added 'addon ^1.0.0'" in add_result.stdout, "add should accept semantic-version constraints")
+    expect("require addon ^1.0.0" in dependencies_path.read_text(), "add should preserve the requested constraint")
+    lock_after_add = lock_path.read_text()
+    expect("package addon 1.2.0#0 " in lock_after_add, "caret constraints should select the newest compatible version")
+
+    write_semver_registry_package(registry, source, source_revision, "leaf", "1.5.1", [])
+    run(["git", "add", "packages/leaf/1.5.1"], cwd=registry)
+    run(["git", "commit", "-m", "Publish compatible leaf update"], cwd=registry)
+
+    run([bspm, "install", "-C", consumer])
+    expect(lock_path.read_text() == lock_after_add, "install should keep exact locked versions after registry updates")
+
+    addon_lock_line = next(line for line in lock_after_add.splitlines() if line.startswith("package addon "))
+    run([bspm, "update", "narrow", "-C", consumer])
+    updated_lock = lock_path.read_text()
+    expect("package leaf 1.5.1#0 " in updated_lock, "a named update should refresh its compatible transitive closure")
+    expect(addon_lock_line in updated_lock, "a named update should preserve unrelated locked packages")
+
+    dependencies_path.write_text(dependencies_path.read_text().replace("require narrow ^1.0.0", "require narrow ^2.0.0"))
+    lock_before_conflict = lock_path.read_text()
+    conflict_result = run([bspm, "update", "-C", consumer], expected=1)
+    expect("cannot resolve package 'leaf'" in conflict_result.stdout, "incompatible ranges should identify the package")
+    expect(
+        "project -> right requires leaf ^1.5.0" in conflict_result.stdout,
+        "conflict diagnostics should show one dependency chain",
+    )
+    expect(
+        "project -> narrow requires leaf ^2.0.0" in conflict_result.stdout,
+        "conflict diagnostics should show the incompatible dependency chain",
+    )
+    expect(lock_path.read_text() == lock_before_conflict, "failed range resolution should preserve bspm.lock")
+
+
+def assert_gcc_header_unit_incremental_build(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:
+    fixture = copy_fixture("header-unit", workspace)
+    run(build_command(bspm, toolchain, fixture))
+
+    incremental_result = run(build_command(bspm, toolchain, fixture, "-v"))
+    expect(
+        "up to date: header unit <cstdio>" in incremental_result.stdout,
+        "unchanged GCC header units should be reused",
+    )
+    expect(
+        "-xc++-system-header" not in incremental_result.stdout,
+        "an unchanged GCC header unit should not invoke the compiler",
+    )
+
+    changed_result = run(
+        build_command(bspm, toolchain, fixture, "--define", "BSPM_HEADER_UNIT_MODE=1", "-v")
+    )
+    expect(
+        "up to date: header unit <cstdio>" not in changed_result.stdout,
+        "changed GCC header-unit compile options should rebuild the artifact",
+    )
+    expect(
+        "-xc++-system-header" in changed_result.stdout,
+        "a stale GCC header unit should invoke the compiler",
+    )
+
+    changed_incremental_result = run(
+        build_command(bspm, toolchain, fixture, "--define", "BSPM_HEADER_UNIT_MODE=1", "-v")
+    )
+    expect(
+        "up to date: header unit <cstdio>" in changed_incremental_result.stdout,
+        "the rebuilt GCC header unit should be reused",
+    )
+
+    result = run([bspm, "run", fixture])
+    expect(result.stdout.strip() == "header-unit: ok", "the GCC header-unit binary should run")
 
 
 def assert_nested_module_binary(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:
@@ -491,14 +851,31 @@ def assert_project_build_run_and_clean(bspm: Path, workspace: Path, toolchain: T
 
 def assert_registry_package_build(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:
     fixture = create_registry_package_fixture(workspace)
+    install_result = run([bspm, "install", "-C", fixture])
+    expect("installed dependencies" in install_result.stdout, "install should resolve dependencies before a build")
+    expect((fixture / "bspm.lock").is_file(), "install should create bspm.lock when it is missing")
     run(build_command(bspm, toolchain, fixture, "--project"))
     incremental_result = run(build_command(bspm, toolchain, fixture, "--project", "-v"))
     expect(
-        "up to date: src/answer.cc" in incremental_result.stdout,
+        "up to date: src/answer.cppm" in incremental_result.stdout,
         "cached package sources should build incrementally",
     )
     result = run([bspm, "run"], cwd=fixture)
     expect(result.stdout.strip() == "package-consumer: 42", "registry package should build, link, and run")
+
+    implicit_fixture = create_implicit_registry_package_fixture(workspace, suffix="-implicit")
+    run([bspm, "add", "answer"], cwd=implicit_fixture)
+    run([bspm, "build", "-c", toolchain.bspm_selector], cwd=implicit_fixture)
+    implicit_incremental = run([bspm, "build", "-v", "-c", toolchain.bspm_selector], cwd=implicit_fixture)
+    expect(
+        "up to date: src/answer.cppm" in implicit_incremental.stdout,
+        "simple package sources should build incrementally",
+    )
+    implicit_result = run([bspm, "run"], cwd=implicit_fixture)
+    expect(
+        implicit_result.stdout.strip() == "package-consumer: 42",
+        "a simple project should import, link, and run its package default target",
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -520,9 +897,12 @@ def main() -> int:
         assert_cli_basics(bspm, toolchain)
         assert_generated_project_scaffolds(bspm, workspace)
         assert_dry_run_plans(bspm, workspace, toolchain)
+        assert_semantic_version_resolution(bspm, workspace)
 
         if level == "full":
             assert_simple_binary(bspm, workspace, toolchain)
+            if toolchain.name == "gcc":
+                assert_gcc_header_unit_incremental_build(bspm, workspace, toolchain)
             assert_nested_module_binary(bspm, workspace, toolchain)
             assert_parallel_build(bspm, workspace, toolchain)
             assert_user_build_options(bspm, workspace, toolchain)

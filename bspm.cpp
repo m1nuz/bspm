@@ -47,6 +47,7 @@ namespace fs = std::filesystem;
 enum class Target { Bin, Lib, Shared };
 enum class Compiler { GCC, Clang, MSVC };
 enum class ModuleUnitKind { None, PrimaryInterface, Implementation, PartitionInterface, InternalPartition };
+enum class PackageResolutionMode { UseLock, UpdateAll, UpdatePackage, ReconcileLock };
 
 constexpr char VersionTag[] = "version";
 constexpr char HelpTag[] = "help";
@@ -57,6 +58,10 @@ constexpr char InitTag[] = "init";
 constexpr char DoctorTag[] = "doctor";
 constexpr char GraphTag[] = "graph";
 constexpr char CompileCommandsTag[] = "compile-commands";
+constexpr char InstallTag[] = "install";
+constexpr char UpdateTag[] = "update";
+constexpr char AddTag[] = "add";
+constexpr char RemoveTag[] = "remove";
 
 constexpr char GPPCompilerTag[] = "g++";
 constexpr char GCCCompilerTag[] = "gcc";
@@ -74,6 +79,10 @@ std::string_view commands[] {
     InitTag,
     BuildTag,
     DoctorTag,
+    InstallTag,
+    UpdateTag,
+    AddTag,
+    RemoveTag,
     GraphTag,
     CompileCommandsTag,
     RunTag,
@@ -103,6 +112,7 @@ constexpr std::string_view IncludeOptTag { "--include" };
 constexpr std::string_view PublicIncludeOptTag { "--public-include" };
 constexpr std::string_view SourceOptTag { "--source" };
 constexpr std::string_view ExcludeOptTag { "--exclude" };
+constexpr std::string_view ChangeDirectoryOptTag { "-C" };
 constexpr std::string_view DefaultRegistryUrl { "https://github.com/m1nuz/bspm-registry.git" };
 constexpr std::string_view DependenciesFileName { "bspm.deps" };
 constexpr std::string_view LockFileName { "bspm.lock" };
@@ -231,6 +241,7 @@ struct Context {
     std::vector<std::string> import_std_modules;
     std::vector<std::string> dependency_import_sys_headers;
     std::vector<std::string> dependency_import_std_modules;
+    std::unordered_map<std::string, fs::path> gcc_header_unit_outputs;
     std::unordered_map<std::string, fs::path> dependency_module_artifacts;
     std::vector<fs::path> dependency_gcc_cache_dirs;
     std::vector<fs::path> dependency_link_inputs;
@@ -265,6 +276,7 @@ struct ProjectConfig {
     std::string name;
     std::string default_target;
     fs::path root;
+    bool implicit_single_target { false };
     std::vector<std::string> common_build_options;
     std::vector<TargetConfig> targets;
 };
@@ -300,8 +312,18 @@ struct PackageMetadata {
     std::string source_revision;
     std::string build_location;
     fs::path build_manifest;
+    std::string default_target;
+    std::vector<std::string> export_targets;
     std::vector<PackageRequirement> requirements;
 };
+
+struct PackageTargetInterface {
+    std::string default_target;
+    std::unordered_set<std::string> targets;
+    std::unordered_set<std::string> exported_targets;
+};
+
+using PackageTargetInterfaces = std::unordered_map<std::string, PackageTargetInterface>;
 
 struct LockedPackage {
     std::string reference;
@@ -1271,6 +1293,38 @@ auto help_command(Context& context, std::string_view command) -> void {
         return;
     }
 
+    if (command == InstallTag) {
+        std::println("Usage:");
+        std::println("\t{} {} [-C <project-dir>]", context.name, InstallTag);
+        std::println("");
+        std::println("Install dependencies exactly from bspm.lock, or resolve bspm.deps and create it.");
+        return;
+    }
+
+    if (command == UpdateTag) {
+        std::println("Usage:");
+        std::println("\t{} {} [package] [-C <project-dir>]", context.name, UpdateTag);
+        std::println("");
+        std::println("Refresh the registry and rewrite bspm.lock for all dependencies or one package closure.");
+        return;
+    }
+
+    if (command == AddTag) {
+        std::println("Usage:");
+        std::println("\t{} {} <package> [constraint] [-C <project-dir>]", context.name, AddTag);
+        std::println("");
+        std::println("Add a direct requirement or semantic-version constraint and update its dependency closure.");
+        return;
+    }
+
+    if (command == RemoveTag) {
+        std::println("Usage:");
+        std::println("\t{} {} <package> [-C <project-dir>]", context.name, RemoveTag);
+        std::println("");
+        std::println("Remove a direct requirement and prune packages no longer reachable from bspm.lock.");
+        return;
+    }
+
     if (command == GraphTag) {
         std::println("Usage:");
         std::println("\t{} {} [dir|target|all] [options]", context.name, GraphTag);
@@ -1981,38 +2035,106 @@ auto prepare_std_module_imports(Context& context) -> bool {
     return true;
 }
 
-auto remove_gcc_header_unit_cache(Context& context) -> bool {
-    if (context.compiler != Compiler::GCC || context.import_sys_headers.empty()) {
-        return true;
+auto path_has_strict_suffix(const fs::path& path, const fs::path& suffix) -> bool {
+    const std::vector<fs::path> path_parts { std::begin(path), std::end(path) };
+    const std::vector<fs::path> suffix_parts { std::begin(suffix), std::end(suffix) };
+    if (path_parts.size() <= suffix_parts.size()) {
+        return false;
     }
 
+    return std::equal(std::crbegin(suffix_parts), std::crend(suffix_parts), std::crbegin(path_parts));
+}
+
+auto find_gcc_header_unit_artifacts(
+    const Context& context, std::string_view header, std::vector<fs::path>& artifacts) -> bool {
+    artifacts.clear();
     const auto cache_path = context.build_dir / "gcm.cache";
     std::error_code ec;
-    if (!fs::exists(cache_path, ec)) {
+    const auto cache_exists = fs::exists(cache_path, ec);
+    if (ec) {
+        std::println("Error: couldn't inspect '{}': {}", cache_path.string(), ec.message());
+        return false;
+    }
+    if (!cache_exists) {
         return true;
     }
 
-    for (const auto& entry : fs::directory_iterator(cache_path, fs::directory_options::skip_permission_denied, ec)) {
-        if (ec) {
-            std::println("Error: couldn't inspect '{}': {}", cache_path.string(), ec.message());
-            return false;
-        }
-
-        if (!entry.is_directory(ec)) {
+    const fs::path expected_suffix { std::string { header } + ".gcm" };
+    for (fs::recursive_directory_iterator it {
+             cache_path, fs::directory_options::skip_permission_denied, ec },
+         end;
+        !ec && it != end; it.increment(ec)) {
+        std::error_code entry_ec;
+        if (!it->is_regular_file(entry_ec)) {
             continue;
         }
 
-        fs::remove_all(entry.path(), ec);
-        if (ec) {
-            std::println("Error: couldn't remove '{}': {}", entry.path().string(), ec.message());
-            return false;
+        auto relative_path = fs::relative(it->path(), cache_path, entry_ec);
+        if (!entry_ec && path_has_strict_suffix(relative_path, expected_suffix)) {
+            artifacts.push_back(it->path());
         }
+    }
+    if (ec) {
+        std::println("Error: couldn't inspect '{}': {}", cache_path.string(), ec.message());
+        return false;
+    }
 
-        if (context.verbose) {
-            std::println("remove stale GCC header unit cache: {}", entry.path().filename().string());
+    std::sort(std::begin(artifacts), std::end(artifacts));
+    return true;
+}
+
+auto prepare_gcc_header_unit(
+    Context& context, std::string_view header, std::span<const std::string> args) -> bool {
+    const auto invocation = make_process_invocation(context, context.cpp_c, args);
+    const std::array<fs::path, 0> inputs {};
+    std::vector<fs::path> artifacts;
+    if (!context.dry_run && !find_gcc_header_unit_artifacts(context, header, artifacts)) {
+        return false;
+    }
+
+    for (const auto& artifact : artifacts) {
+        const std::array outputs { artifact };
+        const auto signature = build_step_signature(invocation.display_command, outputs, inputs);
+        if (step_is_up_to_date(context, outputs, inputs, signature)) {
+            context.gcc_header_unit_outputs[std::string { header }] = artifact;
+            if (context.verbose) {
+                std::println("up to date: header unit <{}>", header);
+            }
+            return true;
         }
     }
 
+    if (!context.dry_run) {
+        for (const auto& artifact : artifacts) {
+            std::error_code ec;
+            fs::remove(artifact, ec);
+            if (ec) {
+                std::println("Error: couldn't remove stale GCC header unit '{}': {}", artifact.string(), ec.message());
+                return false;
+            }
+        }
+    }
+
+    if (!execute_process_invocation(context, invocation)) {
+        return false;
+    }
+    if (context.dry_run) {
+        return true;
+    }
+
+    if (!find_gcc_header_unit_artifacts(context, header, artifacts)) {
+        return false;
+    }
+    if (artifacts.size() != 1) {
+        std::println("Error: expected GCC to produce one cache artifact for header unit <{}>, found {}", header,
+            artifacts.size());
+        return false;
+    }
+
+    const std::array outputs { artifacts.front() };
+    const auto signature = build_step_signature(invocation.display_command, outputs, inputs);
+    record_build_step(context, outputs, signature);
+    context.gcc_header_unit_outputs[std::string { header }] = artifacts.front();
     return true;
 }
 
@@ -2346,7 +2468,14 @@ auto append_dependency_artifact_inputs(std::vector<fs::path>& inputs, const Cont
 }
 
 auto append_header_unit_inputs(std::vector<fs::path>& inputs, const Context& context, const CompileUnit& unit) -> void {
-    if (context.compiler == Compiler::Clang) {
+    if (context.compiler == Compiler::GCC) {
+        for (const auto& header : unit.imports) {
+            if (auto artifact = context.gcc_header_unit_outputs.find(header);
+                artifact != std::end(context.gcc_header_unit_outputs)) {
+                inputs.push_back(artifact->second);
+            }
+        }
+    } else if (context.compiler == Compiler::Clang) {
         for (const auto& header : unit.imports) {
             fs::path header_path { header };
             inputs.push_back((fs::path { ".cache" } / header_path).replace_extension(".pcm"));
@@ -2893,10 +3022,6 @@ auto build_command(Context& context, fs::path dir) -> bool {
         print_build_graph(context);
     }
 
-    if (!remove_gcc_header_unit_cache(context)) {
-        return false;
-    }
-
     std::error_code build_dir_ec;
     fs::create_directories(context.build_dir, build_dir_ec);
     if (build_dir_ec) {
@@ -2940,7 +3065,7 @@ auto build_command(Context& context, fs::path dir) -> bool {
                 args.push_back(std::string { "-c" });
                 args.push_back(header);
 
-                if (!execute_command(context, context.cpp_c, args)) {
+                if (!prepare_gcc_header_unit(context, header, args)) {
                     return false;
                 }
             } else if (context.compiler == Compiler::Clang) {
@@ -4099,14 +4224,300 @@ auto valid_package_name(std::string_view name) -> bool {
     return true;
 }
 
-auto valid_package_version(std::string_view version) -> bool {
-    if (version.empty() || version == "." || version == "..") {
+struct SemanticVersion {
+    std::size_t major { 0 };
+    std::size_t minor { 0 };
+    std::size_t patch { 0 };
+    std::vector<std::string> prerelease;
+    std::string text;
+};
+
+auto valid_semantic_identifier(std::string_view identifier, bool prerelease) -> bool {
+    if (identifier.empty()) {
         return false;
     }
-    return std::all_of(version.begin(), version.end(), [](char value) {
+    if (!std::all_of(identifier.begin(), identifier.end(), [](char value) {
         const auto ch = static_cast<unsigned char>(value);
-        return std::isalnum(ch) || ch == '.' || ch == '-' || ch == '_' || ch == '+';
+        return std::isalnum(ch) || ch == '-';
+    })) {
+        return false;
+    }
+    return !prerelease || identifier.size() == 1 || identifier.front() != '0'
+        || !std::all_of(identifier.begin(), identifier.end(), [](char value) {
+               return std::isdigit(static_cast<unsigned char>(value)) != 0;
+           });
+}
+
+auto parse_semantic_identifiers(
+    std::string_view value, bool prerelease, std::vector<std::string>* identifiers = nullptr) -> bool {
+    if (value.empty()) {
+        return false;
+    }
+    std::size_t begin = 0;
+    while (begin <= value.size()) {
+        const auto end = value.find('.', begin);
+        const auto identifier = value.substr(begin, end == std::string_view::npos ? value.size() - begin : end - begin);
+        if (!valid_semantic_identifier(identifier, prerelease)) {
+            return false;
+        }
+        if (identifiers) {
+            identifiers->emplace_back(identifier);
+        }
+        if (end == std::string_view::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+    return true;
+}
+
+auto parse_semantic_core_number(std::string_view value, std::size_t& number) -> bool {
+    return !value.empty() && (value.size() == 1 || value.front() != '0') && parse_nonnegative_number(value, number);
+}
+
+auto parse_semantic_version(std::string_view value, SemanticVersion& version) -> bool {
+    version = {};
+    if (value.empty()) {
+        return false;
+    }
+
+    const auto build_separator = value.find('+');
+    if (build_separator != std::string_view::npos) {
+        if (value.find('+', build_separator + 1) != std::string_view::npos
+            || !parse_semantic_identifiers(value.substr(build_separator + 1), false)) {
+            return false;
+        }
+    }
+    const auto without_build = value.substr(0, build_separator);
+    const auto prerelease_separator = without_build.find('-');
+    const auto core = without_build.substr(0, prerelease_separator);
+    if (prerelease_separator != std::string_view::npos
+        && !parse_semantic_identifiers(without_build.substr(prerelease_separator + 1), true, &version.prerelease)) {
+        return false;
+    }
+
+    const auto first_dot = core.find('.');
+    const auto second_dot
+        = first_dot == std::string_view::npos ? std::string_view::npos : core.find('.', first_dot + 1);
+    if (first_dot == std::string_view::npos || second_dot == std::string_view::npos
+        || core.find('.', second_dot + 1) != std::string_view::npos
+        || !parse_semantic_core_number(core.substr(0, first_dot), version.major)
+        || !parse_semantic_core_number(core.substr(first_dot + 1, second_dot - first_dot - 1), version.minor)
+        || !parse_semantic_core_number(core.substr(second_dot + 1), version.patch)) {
+        return false;
+    }
+
+    version.text = value;
+    return true;
+}
+
+auto valid_package_version(std::string_view version) -> bool {
+    SemanticVersion parsed;
+    return parse_semantic_version(version, parsed);
+}
+
+auto numeric_identifier(std::string_view identifier) -> bool {
+    return std::all_of(identifier.begin(), identifier.end(), [](char value) {
+        return std::isdigit(static_cast<unsigned char>(value)) != 0;
     });
+}
+
+auto compare_numeric_identifiers(std::string_view left, std::string_view right) -> int {
+    if (left.size() != right.size()) {
+        return left.size() < right.size() ? -1 : 1;
+    }
+    if (left == right) {
+        return 0;
+    }
+    return left < right ? -1 : 1;
+}
+
+auto compare_semantic_versions(const SemanticVersion& left, const SemanticVersion& right) -> int {
+    for (const auto [lhs, rhs] : std::array {
+             std::pair { left.major, right.major },
+             std::pair { left.minor, right.minor },
+             std::pair { left.patch, right.patch },
+         }) {
+        if (lhs != rhs) {
+            return lhs < rhs ? -1 : 1;
+        }
+    }
+    if (left.prerelease.empty() || right.prerelease.empty()) {
+        if (left.prerelease.empty() == right.prerelease.empty()) {
+            return 0;
+        }
+        return left.prerelease.empty() ? 1 : -1;
+    }
+
+    const auto common_size = std::min(left.prerelease.size(), right.prerelease.size());
+    for (std::size_t index = 0; index < common_size; ++index) {
+        const auto& lhs = left.prerelease[index];
+        const auto& rhs = right.prerelease[index];
+        if (lhs == rhs) {
+            continue;
+        }
+        const bool lhs_numeric = numeric_identifier(lhs);
+        const bool rhs_numeric = numeric_identifier(rhs);
+        if (lhs_numeric && rhs_numeric) {
+            return compare_numeric_identifiers(lhs, rhs);
+        }
+        if (lhs_numeric != rhs_numeric) {
+            return lhs_numeric ? -1 : 1;
+        }
+        return lhs < rhs ? -1 : 1;
+    }
+    if (left.prerelease.size() == right.prerelease.size()) {
+        return 0;
+    }
+    return left.prerelease.size() < right.prerelease.size() ? -1 : 1;
+}
+
+enum class VersionComparison { Equal, Less, LessEqual, Greater, GreaterEqual };
+
+struct VersionComparator {
+    VersionComparison comparison { VersionComparison::Equal };
+    SemanticVersion version;
+    std::string exact_version;
+    bool has_package_revision { false };
+    std::size_t package_revision { 0 };
+};
+
+struct VersionConstraint {
+    std::string text;
+    std::vector<VersionComparator> comparators;
+};
+
+auto append_upper_bound(VersionConstraint& constraint, std::size_t major, std::size_t minor, std::size_t patch)
+    -> void {
+    VersionComparator upper;
+    upper.comparison = VersionComparison::Less;
+    upper.version.major = major;
+    upper.version.minor = minor;
+    upper.version.patch = patch;
+    constraint.comparators.push_back(std::move(upper));
+}
+
+auto parse_version_constraint(std::string_view text, VersionConstraint& constraint) -> bool {
+    constraint = {};
+    constraint.text = text;
+    std::size_t cursor = 0;
+    while (cursor < text.size()) {
+        while (cursor < text.size() && std::isspace(static_cast<unsigned char>(text[cursor]))) {
+            ++cursor;
+        }
+        if (cursor == text.size()) {
+            break;
+        }
+        auto end = cursor;
+        while (end < text.size() && !std::isspace(static_cast<unsigned char>(text[end]))) {
+            ++end;
+        }
+        auto token = text.substr(cursor, end - cursor);
+        cursor = end;
+
+        VersionComparator comparator;
+        bool caret = false;
+        bool tilde = false;
+        if (token.starts_with(">=")) {
+            comparator.comparison = VersionComparison::GreaterEqual;
+            token.remove_prefix(2);
+        } else if (token.starts_with("<=")) {
+            comparator.comparison = VersionComparison::LessEqual;
+            token.remove_prefix(2);
+        } else if (token.starts_with('>')) {
+            comparator.comparison = VersionComparison::Greater;
+            token.remove_prefix(1);
+        } else if (token.starts_with('<')) {
+            comparator.comparison = VersionComparison::Less;
+            token.remove_prefix(1);
+        } else if (token.starts_with('=')) {
+            token.remove_prefix(1);
+        } else if (token.starts_with('^')) {
+            comparator.comparison = VersionComparison::GreaterEqual;
+            caret = true;
+            token.remove_prefix(1);
+        } else if (token.starts_with('~')) {
+            comparator.comparison = VersionComparison::GreaterEqual;
+            tilde = true;
+            token.remove_prefix(1);
+        }
+
+        std::string version_text;
+        bool has_revision = false;
+        if (!split_package_version(token, version_text, comparator.package_revision, has_revision)
+            || !parse_semantic_version(version_text, comparator.version)
+            || (has_revision && comparator.comparison != VersionComparison::Equal) || (has_revision && (caret || tilde))) {
+            return false;
+        }
+        comparator.has_package_revision = has_revision;
+        if (comparator.comparison == VersionComparison::Equal) {
+            comparator.exact_version = version_text;
+        }
+        constraint.comparators.push_back(comparator);
+
+        if (caret) {
+            if (comparator.version.major != 0) {
+                append_upper_bound(constraint, comparator.version.major + 1, 0, 0);
+            } else if (comparator.version.minor != 0) {
+                append_upper_bound(constraint, 0, comparator.version.minor + 1, 0);
+            } else {
+                append_upper_bound(constraint, 0, 0, comparator.version.patch + 1);
+            }
+        } else if (tilde) {
+            append_upper_bound(constraint, comparator.version.major, comparator.version.minor + 1, 0);
+        }
+    }
+    return !constraint.comparators.empty();
+}
+
+auto version_constraint_matches(
+    const VersionConstraint& constraint, const SemanticVersion& version, std::size_t package_revision) -> bool {
+    if (!version.prerelease.empty()
+        && std::none_of(constraint.comparators.begin(), constraint.comparators.end(), [&](const auto& comparator) {
+               return !comparator.version.prerelease.empty() && comparator.version.major == version.major
+                   && comparator.version.minor == version.minor && comparator.version.patch == version.patch;
+           })) {
+        return false;
+    }
+
+    return std::all_of(constraint.comparators.begin(), constraint.comparators.end(), [&](const auto& comparator) {
+        const auto comparison = compare_semantic_versions(version, comparator.version);
+        bool matches = false;
+        switch (comparator.comparison) {
+        case VersionComparison::Equal:
+            matches = comparison == 0 && version.text == comparator.exact_version;
+            break;
+        case VersionComparison::Less:
+            matches = comparison < 0;
+            break;
+        case VersionComparison::LessEqual:
+            matches = comparison <= 0;
+            break;
+        case VersionComparison::Greater:
+            matches = comparison > 0;
+            break;
+        case VersionComparison::GreaterEqual:
+            matches = comparison >= 0;
+            break;
+        }
+        return matches && (!comparator.has_package_revision || comparator.package_revision == package_revision);
+    });
+}
+
+auto join_version_constraint_tokens(const std::vector<std::string>& tokens, std::size_t begin) -> std::string {
+    std::string constraint;
+    for (std::size_t index = begin; index < tokens.size(); ++index) {
+        if (!constraint.empty()) {
+            constraint.push_back(' ');
+        }
+        constraint += tokens[index];
+    }
+    return constraint;
+}
+
+auto exact_package_reference(
+    std::string_view reference, std::string& version, std::size_t& revision, bool& has_revision) -> bool {
+    return split_package_version(reference, version, revision, has_revision) && valid_package_version(version);
 }
 
 auto valid_git_revision(std::string_view revision) -> bool {
@@ -4181,8 +4592,8 @@ auto parse_dependencies_config(const fs::path& path, DependenciesConfig& config)
         }
 
         if (tokens[0] == "require") {
-            if (tokens.size() < 2 || tokens.size() > 3 || !valid_package_name(tokens[1])) {
-                std::println("Error: {} line {} expects 'require <package> [version]'", path.filename().string(),
+            if (tokens.size() < 2 || !valid_package_name(tokens[1])) {
+                std::println("Error: {} line {} expects 'require <package> [constraint]'", path.filename().string(),
                     logical_line_number);
                 return false;
             }
@@ -4191,7 +4602,16 @@ auto parse_dependencies_config(const fs::path& path, DependenciesConfig& config)
                 std::println("Error: package '{}' is required more than once", tokens[1]);
                 return false;
             }
-            config.requirements.push_back({ .name = tokens[1], .version = tokens.size() == 3 ? tokens[2] : "" });
+            auto constraint_text = join_version_constraint_tokens(tokens, 2);
+            if (!constraint_text.empty()) {
+                VersionConstraint constraint;
+                if (!parse_version_constraint(constraint_text, constraint)) {
+                    std::println("Error: invalid package constraint '{}' for '{}' on line {}", constraint_text,
+                        tokens[1], logical_line_number);
+                    return false;
+                }
+            }
+            config.requirements.push_back({ .name = tokens[1], .version = std::move(constraint_text) });
             continue;
         }
 
@@ -4257,8 +4677,7 @@ auto parse_lock_config(const fs::path& path, LockConfig& config) -> bool {
             std::string version;
             std::size_t revision = 0;
             bool has_revision = false;
-            if (!split_package_version(tokens[2], version, revision, has_revision) || !has_revision
-                || !valid_package_version(version)) {
+            if (!exact_package_reference(tokens[2], version, revision, has_revision) || !has_revision) {
                 std::println("Error: invalid locked package reference '{}' on line {}", tokens[2], line_number);
                 return false;
             }
@@ -4280,6 +4699,43 @@ auto parse_lock_config(const fs::path& path, LockConfig& config) -> bool {
     return true;
 }
 
+auto install_temporary_file(const fs::path& temporary_path, const fs::path& path,
+    std::string_view description) -> bool {
+    std::error_code install_ec;
+#if defined(_WIN32) || defined(_WIN64)
+    if (!MoveFileExW(temporary_path.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        install_ec = { static_cast<int>(GetLastError()), std::system_category() };
+    }
+#else
+    fs::rename(temporary_path, path, install_ec);
+#endif
+    if (install_ec) {
+        std::error_code cleanup_ec;
+        fs::remove(temporary_path, cleanup_ec);
+        std::println("Error: couldn't install {} '{}': {}", description, path.string(), install_ec.message());
+        return false;
+    }
+    return true;
+}
+
+auto write_text_file_atomically(const fs::path& path, std::string_view contents,
+    std::string_view description) -> bool {
+    auto temporary_path = path;
+    temporary_path += ".tmp";
+    std::ofstream file { temporary_path, std::ios::binary | std::ios::trunc };
+    if (!file) {
+        std::println("Error: couldn't write {} '{}'", description, temporary_path.string());
+        return false;
+    }
+    file << contents;
+    file.close();
+    if (!file) {
+        std::println("Error: couldn't finish writing {} '{}'", description, temporary_path.string());
+        return false;
+    }
+    return install_temporary_file(temporary_path, path, description);
+}
+
 auto write_lock_config(const fs::path& path, std::string_view registry_source, std::string_view registry_revision,
     const std::unordered_map<std::string, LockedPackage>& packages) -> bool {
     std::vector<std::string> package_names;
@@ -4290,36 +4746,13 @@ auto write_lock_config(const fs::path& path, std::string_view registry_source, s
     }
     std::sort(package_names.begin(), package_names.end());
 
-    auto temporary_path = path;
-    temporary_path += ".tmp";
-    std::ofstream file { temporary_path, std::ios::trunc };
-    if (!file) {
-        std::println("Error: couldn't write lockfile '{}'", temporary_path.string());
-        return false;
-    }
-
-    file << "format 1\n";
-    file << "registry " << quote_arg(registry_source) << ' ' << registry_revision << "\n";
+    std::string contents { "format 1\n" };
+    contents += "registry " + quote_arg(registry_source) + ' ' + std::string { registry_revision } + "\n";
     for (const auto& name : package_names) {
         const auto& package = packages.at(name);
-        file << "package " << name << ' ' << package.reference << ' ' << package.source_revision << "\n";
+        contents += "package " + name + ' ' + package.reference + ' ' + package.source_revision + "\n";
     }
-    file.close();
-    if (!file) {
-        std::println("Error: couldn't finish writing lockfile '{}'", temporary_path.string());
-        return false;
-    }
-
-    std::error_code ec;
-    fs::rename(temporary_path, path, ec);
-    if (ec) {
-        const auto rename_error = ec.message();
-        std::error_code cleanup_ec;
-        fs::remove(temporary_path, cleanup_ec);
-        std::println("Error: couldn't install lockfile '{}': {}", path.string(), rename_error);
-        return false;
-    }
-    return true;
+    return write_text_file_atomically(path, contents, "lockfile");
 }
 
 auto validate_registry_config(const fs::path& registry_root) -> bool {
@@ -4382,8 +4815,11 @@ auto parse_registry_baseline(const fs::path& registry_root, std::unordered_map<s
         if (tokens.empty()) {
             continue;
         }
+        std::string version;
+        std::size_t revision = 0;
+        bool has_revision = false;
         if (tokens.size() != 3 || tokens[0] != "package" || !valid_package_name(tokens[1])
-            || baseline.contains(tokens[1])) {
+            || baseline.contains(tokens[1]) || !exact_package_reference(tokens[2], version, revision, has_revision)) {
             std::println("Error: baseline.bspm line {} expects a unique 'package <name> <version>'", line_number);
             return false;
         }
@@ -4435,9 +4871,23 @@ auto parse_package_metadata(const fs::path& path, PackageMetadata& metadata) -> 
         } else if (tokens[0] == "build" && tokens.size() == 3 && metadata.build_location.empty()) {
             metadata.build_location = tokens[1];
             metadata.build_manifest = tokens[2];
-        } else if (tokens[0] == "require" && (tokens.size() == 2 || tokens.size() == 3)
-            && valid_package_name(tokens[1])) {
-            metadata.requirements.push_back({ .name = tokens[1], .version = tokens.size() == 3 ? tokens[2] : "" });
+        } else if (tokens[0] == "default-target" && tokens.size() == 2 && metadata.default_target.empty()) {
+            metadata.default_target = tokens[1];
+        } else if (tokens[0] == "export-target" && tokens.size() == 2
+            && std::find(metadata.export_targets.begin(), metadata.export_targets.end(), tokens[1])
+                == metadata.export_targets.end()) {
+            metadata.export_targets.push_back(tokens[1]);
+        } else if (tokens[0] == "require" && tokens.size() >= 2 && valid_package_name(tokens[1])) {
+            auto constraint_text = join_version_constraint_tokens(tokens, 2);
+            if (!constraint_text.empty()) {
+                VersionConstraint constraint;
+                if (!parse_version_constraint(constraint_text, constraint)) {
+                    std::println("Error: invalid package constraint '{}' for '{}' in '{}'", constraint_text,
+                        tokens[1], path.string());
+                    return false;
+                }
+            }
+            metadata.requirements.push_back({ .name = tokens[1], .version = std::move(constraint_text) });
         } else {
             std::println("Error: invalid package.bspm directive on line {}", logical_line_number);
             return false;
@@ -4612,19 +5062,27 @@ auto materialize_registry(const ProjectConfig& project, std::string_view configu
             fs::remove_all(registry_root, ec);
             return false;
         }
-    } else if (locked_revision.empty()) {
-        std::println("update registry: {}", registry_source);
-        const std::vector<std::string> fetch_args {
-            "-C", path_arg(registry_root), "fetch", "--depth", "1", "origin"
+    } else {
+        const std::vector<std::string> origin_args {
+            "-C", path_arg(registry_root), "remote", "set-url", "origin", quote_arg(registry_source)
         };
-        if (!run_git(fetch_args)) {
+        if (!run_git(origin_args)) {
             return false;
         }
-        const std::vector<std::string> checkout_args {
-            "-C", path_arg(registry_root), "checkout", "--detach", "FETCH_HEAD"
-        };
-        if (!run_git(checkout_args)) {
-            return false;
+        if (locked_revision.empty()) {
+            std::println("update registry: {}", registry_source);
+            const std::vector<std::string> fetch_args {
+                "-C", path_arg(registry_root), "fetch", "--depth", "1", "origin"
+            };
+            if (!run_git(fetch_args)) {
+                return false;
+            }
+            const std::vector<std::string> checkout_args {
+                "-C", path_arg(registry_root), "checkout", "--detach", "FETCH_HEAD"
+            };
+            if (!run_git(checkout_args)) {
+                return false;
+            }
         }
     }
 
@@ -4694,6 +5152,12 @@ auto materialize_package_source(const ProjectConfig& project, const PackageMetad
             return false;
         }
     } else {
+        const std::vector<std::string> origin_args {
+            "-C", path_arg(source_root), "remote", "set-url", "origin", quote_arg(source)
+        };
+        if (!run_git(origin_args)) {
+            return false;
+        }
         const std::vector<std::string> fetch_args {
             "-C", path_arg(source_root), "fetch", "--depth", "1", "origin", metadata.source_revision
         };
@@ -4718,9 +5182,8 @@ auto materialize_package_source(const ProjectConfig& project, const PackageMetad
     return true;
 }
 
-auto import_package_targets(
-    ProjectConfig& project, const PackageMetadata& metadata, const fs::path& source_root, const fs::path& metadata_path)
-    -> bool {
+auto import_package_targets(ProjectConfig& project, const PackageMetadata& metadata, const fs::path& source_root,
+    const fs::path& metadata_path, PackageTargetInterface& package_interface) -> bool {
     const auto manifest_root = metadata.build_location == "registry" ? metadata_path.parent_path() : source_root;
     const auto manifest_path = metadata.build_location == "registry"
         ? metadata_path.parent_path() / metadata.build_manifest
@@ -4737,12 +5200,52 @@ auto import_package_targets(
         return false;
     }
 
+    const auto local_target_exists = [&](std::string_view name) {
+        return std::any_of(package_project.targets.begin(), package_project.targets.end(),
+            [&](const auto& target) { return target.name == name; });
+    };
+    const auto& default_target
+        = metadata.default_target.empty() ? package_project.default_target : metadata.default_target;
+    if (!default_target.empty() && !local_target_exists(default_target)) {
+        std::println("Error: package '{}' default target '{}' is not defined by its build recipe", metadata.name,
+            default_target);
+        return false;
+    }
+    for (const auto& exported_target : metadata.export_targets) {
+        if (!local_target_exists(exported_target)) {
+            std::println("Error: package '{}' export target '{}' is not defined by its build recipe", metadata.name,
+                exported_target);
+            return false;
+        }
+    }
+    if (!default_target.empty() && !metadata.export_targets.empty()
+        && std::find(metadata.export_targets.begin(), metadata.export_targets.end(), default_target)
+            == metadata.export_targets.end()) {
+        std::println("Error: package '{}' default target '{}' is not exported", metadata.name,
+            default_target);
+        return false;
+    }
+
+    if (!default_target.empty()) {
+        package_interface.default_target = metadata.name + "::" + default_target;
+    }
+    for (const auto& target : package_project.targets) {
+        package_interface.targets.insert(metadata.name + "::" + target.name);
+    }
+    if (metadata.export_targets.empty()) {
+        package_interface.exported_targets = package_interface.targets;
+    } else {
+        for (const auto& exported_target : metadata.export_targets) {
+            package_interface.exported_targets.insert(metadata.name + "::" + exported_target);
+        }
+    }
+
     for (auto target : package_project.targets) {
         const auto local_name = target.name;
         target.name = metadata.name + "::" + local_name;
         target.path = fs::absolute(source_root / target.path).lexically_normal();
         for (auto& dependency : target.dependencies) {
-            if (dependency.find("::") == std::string::npos) {
+            if (!dependency.starts_with('@') && dependency.find("::") == std::string::npos) {
                 dependency = metadata.name + "::" + dependency;
             }
         }
@@ -4756,20 +5259,209 @@ auto import_package_targets(
     return true;
 }
 
-auto validate_project_dependencies(const ProjectConfig& project) -> bool {
-    for (const auto& target : project.targets) {
-        for (const auto& dependency : target.dependencies) {
+auto resolve_and_validate_project_dependencies(
+    ProjectConfig& project, const PackageTargetInterfaces& package_interfaces) -> bool {
+    const auto package_owning_target = [&](std::string_view target_name) -> const std::string* {
+        for (const auto& [package_name, package_interface] : package_interfaces) {
+            if (package_interface.targets.contains(std::string { target_name })) {
+                return &package_name;
+            }
+        }
+        return nullptr;
+    };
+
+    for (auto& target : project.targets) {
+        const auto* consumer_package = package_owning_target(target.name);
+        for (auto& dependency : target.dependencies) {
+            if (dependency.starts_with('@')) {
+                const auto package_name = dependency.substr(1);
+                const auto package = package_interfaces.find(package_name);
+                if (!valid_package_name(package_name) || package == package_interfaces.end()) {
+                    std::println("Error: target '{}' depends on unknown package alias '{}'", target.name, dependency);
+                    return false;
+                }
+                if (package->second.default_target.empty()) {
+                    std::println("Error: package '{}' does not declare a default target", package_name);
+                    return false;
+                }
+                dependency = package->second.default_target;
+            }
+
             if (!find_target(project, dependency)) {
                 std::println("Error: target '{}' depends on unknown target '{}'", target.name, dependency);
                 return false;
+            }
+
+            const auto* dependency_package = package_owning_target(dependency);
+            if (dependency_package && (!consumer_package || *dependency_package != *consumer_package)) {
+                const auto& package_interface = package_interfaces.at(*dependency_package);
+                if (!package_interface.exported_targets.contains(dependency)) {
+                    std::println("Error: target '{}' depends on unexported package target '{}'", target.name,
+                        dependency);
+                    return false;
+                }
             }
         }
     }
     return true;
 }
 
-auto prepare_project_packages(ProjectConfig& project) -> bool {
+struct RegistryPackageCandidate {
+    SemanticVersion semantic_version;
+    PackageMetadata metadata;
+    fs::path metadata_path;
+};
+
+struct PackageConstraintSource {
+    VersionConstraint constraint;
+    std::vector<std::string> path;
+};
+
+struct PendingPackageRequirement {
+    PackageRequirement requirement;
+    std::vector<std::string> path;
+    bool allow_update { false };
+};
+
+struct PackageSolverState {
+    std::unordered_map<std::string, std::vector<PackageConstraintSource>> constraints;
+    std::unordered_map<std::string, std::size_t> selections;
+    std::unordered_set<std::string> updateable_packages;
+};
+
+struct PackageResolutionFailure {
+    std::size_t score { 0 };
+    std::string message;
+};
+
+auto package_reference(const RegistryPackageCandidate& candidate) -> std::string {
+    return candidate.metadata.version + "#" + std::to_string(candidate.metadata.package_revision);
+}
+
+auto load_registry_package_candidates(const fs::path& registry_root, std::string_view package,
+    std::vector<RegistryPackageCandidate>& candidates) -> bool {
+    candidates.clear();
+    const auto package_root = registry_root / "packages" / fs::path { package };
+    std::error_code ec;
+    const auto root_exists = fs::is_directory(package_root, ec);
+    if (ec) {
+        std::println("Error: couldn't inspect registry package '{}': {}", package_root.string(), ec.message());
+        return false;
+    }
+    if (!root_exists) {
+        return true;
+    }
+
+    for (fs::directory_iterator it { package_root, fs::directory_options::skip_permission_denied, ec }, end;
+        !ec && it != end; it.increment(ec)) {
+        std::error_code entry_ec;
+        if (!it->is_directory(entry_ec)) {
+            continue;
+        }
+
+        SemanticVersion semantic_version;
+        const auto version = it->path().filename().string();
+        if (!parse_semantic_version(version, semantic_version)) {
+            continue;
+        }
+
+        const auto metadata_path = it->path() / "package.bspm";
+        PackageMetadata metadata;
+        if (!parse_package_metadata(metadata_path, metadata)) {
+            return false;
+        }
+        if (metadata.name != package || metadata.version != version) {
+            std::println("Error: package metadata '{}' does not match registry package '{} {}'", metadata_path.string(),
+                package, version);
+            return false;
+        }
+        candidates.push_back({
+            .semantic_version = std::move(semantic_version),
+            .metadata = std::move(metadata),
+            .metadata_path = metadata_path,
+        });
+    }
+    if (ec) {
+        std::println("Error: couldn't inspect registry package '{}': {}", package_root.string(), ec.message());
+        return false;
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
+        const auto precedence = compare_semantic_versions(left.semantic_version, right.semantic_version);
+        if (precedence != 0) {
+            return precedence > 0;
+        }
+        if (left.metadata.package_revision != right.metadata.package_revision) {
+            return left.metadata.package_revision > right.metadata.package_revision;
+        }
+        return left.metadata.version > right.metadata.version;
+    });
+    return true;
+}
+
+auto package_constraint_text(const PackageRequirement& requirement,
+    const std::unordered_map<std::string, std::string>& baseline, std::string& text) -> bool {
+    text = requirement.version;
+    if (!text.empty()) {
+        return true;
+    }
+    const auto baseline_it = baseline.find(requirement.name);
+    if (baseline_it == baseline.end()) {
+        return false;
+    }
+    text = baseline_it->second;
+    return true;
+}
+
+auto candidate_satisfies_constraints(
+    const RegistryPackageCandidate& candidate, std::span<const PackageConstraintSource> constraints) -> bool {
+    return std::all_of(constraints.begin(), constraints.end(), [&](const auto& source) {
+        return version_constraint_matches(
+            source.constraint, candidate.semantic_version, candidate.metadata.package_revision);
+    });
+}
+
+auto package_constraint_path(const PackageConstraintSource& source, std::string_view package) -> std::string {
+    std::string result;
+    for (const auto& segment : source.path) {
+        if (!result.empty()) {
+            result += " -> ";
+        }
+        result += segment;
+    }
+    if (result.empty()) {
+        result = "project";
+    }
+    result += " requires ";
+    result += package;
+    result += " ";
+    result += source.constraint.text;
+    return result;
+}
+
+auto record_package_resolution_failure(PackageResolutionFailure& failure, std::string_view package,
+    std::span<const PackageConstraintSource> constraints, std::string_view reason = {}) -> void {
+    std::size_t score = constraints.size() * 100;
+    std::string message = "cannot resolve package '" + std::string { package } + "'";
+    if (!reason.empty()) {
+        message += ": ";
+        message += reason;
+    }
+    for (const auto& constraint : constraints) {
+        score += constraint.path.size();
+        message += "\n  ";
+        message += package_constraint_path(constraint, package);
+    }
+    if (score >= failure.score) {
+        failure.score = score;
+        failure.message = std::move(message);
+    }
+}
+
+auto prepare_project_packages(ProjectConfig& project, PackageResolutionMode mode = PackageResolutionMode::UseLock,
+    std::string_view update_package = {}) -> bool {
     const auto dependencies_path = project.root / DependenciesFileName;
+    const auto lock_path = project.root / LockFileName;
     std::error_code dependency_ec;
     if (!fs::exists(dependencies_path, dependency_ec)
         && fs::is_regular_file(project.root / ".dependencies", dependency_ec)) {
@@ -4782,23 +5474,55 @@ auto prepare_project_packages(ProjectConfig& project) -> bool {
         return false;
     }
 
+    if (project.implicit_single_target) {
+        if (project.targets.size() != 1) {
+            std::println("Error: implicit project '{}' must contain exactly one target", project.root.string());
+            return false;
+        }
+        for (const auto& requirement : dependencies.requirements) {
+            const auto dependency = "@" + requirement.name;
+            if (std::find(project.targets.front().dependencies.begin(), project.targets.front().dependencies.end(),
+                    dependency)
+                == project.targets.front().dependencies.end()) {
+                project.targets.front().dependencies.push_back(dependency);
+            }
+        }
+    }
+
     LockConfig lock;
-    if (!parse_lock_config(project.root / LockFileName, lock)) {
+    if (mode != PackageResolutionMode::UpdateAll && !parse_lock_config(lock_path, lock)) {
         return false;
     }
     if (dependencies.requirements.empty()) {
-        if (lock.present) {
-            std::println("Error: bspm.lock contains packages, but bspm.deps has no requirements; remove bspm.lock");
+        if (mode == PackageResolutionMode::UpdatePackage) {
+            std::println("Error: '{}' is not a direct requirement in bspm.deps", update_package);
             return false;
         }
-        return validate_project_dependencies(project);
+        if (mode == PackageResolutionMode::UseLock && lock.present) {
+            std::println("Error: bspm.lock contains packages, but bspm.deps has no requirements; run 'bspm update'");
+            return false;
+        }
+        if (!resolve_and_validate_project_dependencies(project, {})) {
+            return false;
+        }
+        if (mode != PackageResolutionMode::UseLock) {
+            std::error_code remove_ec;
+            fs::remove(lock_path, remove_ec);
+            if (remove_ec) {
+                std::println("Error: couldn't remove obsolete lockfile '{}': {}", lock_path.string(),
+                    remove_ec.message());
+                return false;
+            }
+        }
+        return true;
     }
 
     const std::string requested_registry_source = dependencies.registry.empty()
         ? std::string { DefaultRegistryUrl }
         : dependencies.registry;
-    if (lock.present && lock.registry_source != requested_registry_source) {
-        std::println("Error: bspm.deps selects registry '{}', but bspm.lock pins '{}'; remove bspm.lock to resolve again",
+    if (lock.present && lock.registry_source != requested_registry_source
+        && mode != PackageResolutionMode::UpdateAll) {
+        std::println("Error: bspm.deps selects registry '{}', but bspm.lock pins '{}'; run 'bspm update' to resolve everything",
             requested_registry_source, lock.registry_source);
         return false;
     }
@@ -4806,8 +5530,12 @@ auto prepare_project_packages(ProjectConfig& project) -> bool {
     fs::path registry_root;
     std::string registry_source;
     std::string registry_revision;
-    if (!materialize_registry(project, dependencies.registry, lock.registry_revision, registry_root, registry_source,
-            registry_revision)) {
+    const auto locked_registry_revision
+        = mode == PackageResolutionMode::UseLock || mode == PackageResolutionMode::ReconcileLock
+        ? std::string_view { lock.registry_revision }
+        : std::string_view {};
+    if (!materialize_registry(project, dependencies.registry, locked_registry_revision, registry_root,
+            registry_source, registry_revision)) {
         return false;
     }
 
@@ -4816,143 +5544,239 @@ auto prepare_project_packages(ProjectConfig& project) -> bool {
         return false;
     }
 
+    if (mode == PackageResolutionMode::UpdatePackage
+        && std::none_of(dependencies.requirements.begin(), dependencies.requirements.end(),
+            [&](const auto& requirement) { return requirement.name == update_package; })) {
+        std::println("Error: '{}' is not a direct requirement in bspm.deps", update_package);
+        return false;
+    }
+
+    std::unordered_map<std::string, std::vector<RegistryPackageCandidate>> candidate_cache;
+    PackageResolutionFailure resolution_failure;
+    PackageSolverState solved_state;
+    bool resolver_error = false;
+
+    const auto candidates_for = [&](std::string_view package) -> std::vector<RegistryPackageCandidate>* {
+        auto cached = candidate_cache.find(std::string { package });
+        if (cached != candidate_cache.end()) {
+            return &cached->second;
+        }
+        std::vector<RegistryPackageCandidate> candidates;
+        if (!load_registry_package_candidates(registry_root, package, candidates)) {
+            resolver_error = true;
+            return nullptr;
+        }
+        return &candidate_cache.emplace(std::string { package }, std::move(candidates)).first->second;
+    };
+
+    std::function<bool(PackageSolverState, std::vector<PendingPackageRequirement>)> solve_packages
+        = [&](PackageSolverState state, std::vector<PendingPackageRequirement> pending) {
+              if (pending.empty()) {
+                  solved_state = std::move(state);
+                  return true;
+              }
+
+              auto current = std::move(pending.back());
+              pending.pop_back();
+              std::string constraint_text;
+              if (!package_constraint_text(current.requirement, baseline, constraint_text)) {
+                  PackageConstraintSource source { .constraint = {}, .path = current.path };
+                  source.constraint.text = "<missing baseline>";
+                  state.constraints[current.requirement.name].push_back(std::move(source));
+                  record_package_resolution_failure(resolution_failure, current.requirement.name,
+                      state.constraints[current.requirement.name], "no requested version or registry baseline");
+                  return false;
+              }
+
+              VersionConstraint constraint;
+              if (!parse_version_constraint(constraint_text, constraint)) {
+                  PackageConstraintSource source { .constraint = {}, .path = current.path };
+                  source.constraint.text = constraint_text;
+                  state.constraints[current.requirement.name].push_back(std::move(source));
+                  record_package_resolution_failure(resolution_failure, current.requirement.name,
+                      state.constraints[current.requirement.name], "invalid semantic-version constraint");
+                  return false;
+              }
+              state.constraints[current.requirement.name].push_back({
+                  .constraint = std::move(constraint),
+                  .path = current.path,
+              });
+              if (current.allow_update) {
+                  state.updateable_packages.insert(current.requirement.name);
+              }
+
+              auto* candidates = candidates_for(current.requirement.name);
+              if (!candidates) {
+                  return false;
+              }
+              const auto& constraints = state.constraints.at(current.requirement.name);
+              if (const auto selected = state.selections.find(current.requirement.name);
+                  selected != state.selections.end()) {
+                  if (candidate_satisfies_constraints((*candidates)[selected->second], constraints)) {
+                      return solve_packages(std::move(state), std::move(pending));
+                  }
+                  record_package_resolution_failure(resolution_failure, current.requirement.name, constraints,
+                      "selected versions have incompatible requirements");
+                  return false;
+              }
+
+              std::vector<std::size_t> candidate_indices;
+              const bool use_locked_package = lock.present && mode != PackageResolutionMode::UpdateAll
+                  && !(mode == PackageResolutionMode::UpdatePackage
+                      && state.updateable_packages.contains(current.requirement.name));
+              if (use_locked_package) {
+                  const auto locked = lock.packages.find(current.requirement.name);
+                  if (locked == lock.packages.end()) {
+                      record_package_resolution_failure(resolution_failure, current.requirement.name, constraints,
+                          "bspm.lock is out of date because the package is not locked; run 'bspm update'");
+                      return false;
+                  }
+                  for (std::size_t index = 0; index < candidates->size(); ++index) {
+                      if (package_reference((*candidates)[index]) == locked->second.reference) {
+                          candidate_indices.push_back(index);
+                          break;
+                      }
+                  }
+                  if (candidate_indices.empty()) {
+                      record_package_resolution_failure(resolution_failure, current.requirement.name, constraints,
+                          "locked version '" + locked->second.reference + "' is unavailable in the pinned registry");
+                      return false;
+                  }
+              } else {
+                  candidate_indices.resize(candidates->size());
+                  for (std::size_t index = 0; index < candidates->size(); ++index) {
+                      candidate_indices[index] = index;
+                  }
+              }
+
+              for (const auto candidate_index : candidate_indices) {
+                  const auto& candidate = (*candidates)[candidate_index];
+                  if (!candidate_satisfies_constraints(candidate, constraints)) {
+                      continue;
+                  }
+
+                  auto branch = state;
+                  branch.selections[current.requirement.name] = candidate_index;
+                  auto branch_pending = pending;
+                  auto dependency_path = current.path;
+                  dependency_path.push_back(current.requirement.name);
+                  const bool update_dependencies = branch.updateable_packages.contains(current.requirement.name);
+                  for (auto dependency = candidate.metadata.requirements.rbegin();
+                      dependency != candidate.metadata.requirements.rend(); ++dependency) {
+                      branch_pending.push_back({
+                          .requirement = *dependency,
+                          .path = dependency_path,
+                          .allow_update = update_dependencies,
+                      });
+                  }
+                  if (solve_packages(std::move(branch), std::move(branch_pending))) {
+                      return true;
+                  }
+                  if (resolver_error) {
+                      return false;
+                  }
+              }
+
+              record_package_resolution_failure(resolution_failure, current.requirement.name, constraints,
+                  use_locked_package
+                      ? "bspm.lock is out of date because its locked version does not satisfy all constraints; run 'bspm update'"
+                      : "no available version satisfies all constraints");
+              return false;
+          };
+
+    std::vector<PendingPackageRequirement> pending;
+    for (auto requirement = dependencies.requirements.rbegin(); requirement != dependencies.requirements.rend();
+        ++requirement) {
+        if (mode != PackageResolutionMode::UpdatePackage || requirement->name != update_package) {
+            pending.push_back({ .requirement = *requirement, .path = { "project" } });
+        }
+    }
+    if (mode == PackageResolutionMode::UpdatePackage) {
+        const auto root = std::find_if(dependencies.requirements.begin(), dependencies.requirements.end(),
+            [&](const auto& requirement) { return requirement.name == update_package; });
+        pending.push_back({ .requirement = *root, .path = { "project" }, .allow_update = true });
+    }
+
+    if (!solve_packages({}, std::move(pending))) {
+        if (!resolver_error) {
+            std::println("Error: {}", resolution_failure.message);
+        }
+        return false;
+    }
+
     enum class PackageVisitState { Visiting, Visited };
     std::unordered_map<std::string, PackageVisitState> states;
-    std::unordered_map<std::string, std::string> resolved_versions;
     std::unordered_map<std::string, LockedPackage> resolved_packages;
-
-    std::function<bool(const PackageRequirement&)> resolve = [&](const PackageRequirement& requirement) {
-        std::string version_reference;
-        if (lock.present) {
-            const auto locked = lock.packages.find(requirement.name);
-            if (locked == std::end(lock.packages)) {
-                std::println("Error: bspm.lock is out of date: package '{}' is not locked; remove bspm.lock to resolve again",
-                    requirement.name);
-                return false;
-            }
-            version_reference = locked->second.reference;
-
-            if (!requirement.version.empty()) {
-                std::string requested_version;
-                std::size_t requested_revision = 0;
-                bool has_requested_revision = false;
-                std::string locked_version;
-                std::size_t locked_package_revision = 0;
-                bool has_locked_revision = false;
-                if (!split_package_version(
-                        requirement.version, requested_version, requested_revision, has_requested_revision)
-                    || !valid_package_version(requested_version)) {
-                    std::println("Error: invalid package version '{}' for '{}'", requirement.version,
-                        requirement.name);
-                    return false;
-                }
-                split_package_version(version_reference, locked_version, locked_package_revision, has_locked_revision);
-                if (requested_version != locked_version
-                    || (has_requested_revision && requested_revision != locked_package_revision)) {
-                    std::println("Error: bspm.lock is out of date: package '{}' requires '{}', but '{}' is locked; remove bspm.lock to resolve again",
-                        requirement.name, requirement.version, version_reference);
-                    return false;
-                }
-            }
-        } else if (!requirement.version.empty()) {
-            version_reference = requirement.version;
-        } else {
-            const auto baseline_it = baseline.find(requirement.name);
-            if (baseline_it == std::end(baseline)) {
-                std::println("Error: package '{}' has no requested version or registry baseline", requirement.name);
-                return false;
-            }
-            version_reference = baseline_it->second;
-        }
-
-        std::string version;
-        std::size_t requested_revision = 0;
-        bool has_requested_revision = false;
-        if (!split_package_version(version_reference, version, requested_revision, has_requested_revision)
-            || !valid_package_version(version)) {
-            std::println("Error: invalid package version '{}' for '{}'", version_reference, requirement.name);
-            return false;
-        }
-
-        if (const auto state = states.find(requirement.name);
-            state != std::end(states) && state->second == PackageVisitState::Visiting) {
-            std::println("Error: cyclic package dependency involving '{}'", requirement.name);
-            return false;
-        }
-
-        if (const auto resolved = resolved_versions.find(requirement.name); resolved != std::end(resolved_versions)) {
-            std::string resolved_version;
-            std::size_t resolved_revision = 0;
-            bool has_resolved_revision = false;
-            split_package_version(resolved->second, resolved_version, resolved_revision, has_resolved_revision);
-            if (resolved_version != version || (has_requested_revision && resolved_revision != requested_revision)) {
-                std::println("Error: package '{}' requires conflicting versions '{}' and '{}'", requirement.name,
-                    resolved->second, version_reference);
+    PackageTargetInterfaces package_interfaces;
+    std::function<bool(std::string_view)> materialize_selected_package = [&](std::string_view package) {
+        if (const auto state = states.find(std::string { package }); state != states.end()) {
+            if (state->second == PackageVisitState::Visiting) {
+                std::println("Error: cyclic package dependency involving '{}'", package);
                 return false;
             }
             return true;
         }
-        states[requirement.name] = PackageVisitState::Visiting;
+        states[std::string { package }] = PackageVisitState::Visiting;
 
-        const auto metadata_path = registry_root / "packages" / fs::path { requirement.name } / version / "package.bspm";
-        PackageMetadata metadata;
-        if (!parse_package_metadata(metadata_path, metadata)) {
+        const auto selected = solved_state.selections.find(std::string { package });
+        const auto cached = candidate_cache.find(std::string { package });
+        if (selected == solved_state.selections.end() || cached == candidate_cache.end()) {
+            std::println("Error: internal resolver error: package '{}' was not selected", package);
             return false;
         }
-        if (metadata.name != requirement.name || metadata.version != version
-            || (has_requested_revision && metadata.package_revision != requested_revision)) {
-            std::println("Error: package metadata '{}' does not match requested package '{} {}'", metadata_path.string(),
-                requirement.name, version_reference);
-            return false;
+        const auto& candidate = cached->second[selected->second];
+        for (const auto& dependency : candidate.metadata.requirements) {
+            if (!materialize_selected_package(dependency.name)) {
+                return false;
+            }
         }
 
-        const auto resolved_reference
-            = metadata.version + "#" + std::to_string(metadata.package_revision);
-        if (lock.present) {
-            const auto& locked = lock.packages.at(metadata.name);
+        const auto resolved_reference = package_reference(candidate);
+        const bool use_locked_package = lock.present && mode != PackageResolutionMode::UpdateAll
+            && !(mode == PackageResolutionMode::UpdatePackage
+                && solved_state.updateable_packages.contains(std::string { package }));
+        if (use_locked_package) {
+            const auto& locked = lock.packages.at(std::string { package });
             if (locked.reference != resolved_reference
-                || !git_revisions_equal(locked.source_revision, metadata.source_revision)) {
-                std::println("Error: locked package '{} {}' does not match the pinned registry metadata",
-                    metadata.name, locked.reference);
+                || !git_revisions_equal(locked.source_revision, candidate.metadata.source_revision)) {
+                std::println("Error: locked package '{} {}' does not match the pinned registry metadata", package,
+                    locked.reference);
                 return false;
             }
         }
-        resolved_versions[metadata.name] = resolved_reference;
-        resolved_packages[metadata.name] = LockedPackage {
+        resolved_packages[std::string { package }] = LockedPackage {
             .reference = resolved_reference,
-            .source_revision = metadata.source_revision,
+            .source_revision = candidate.metadata.source_revision,
         };
-        for (const auto& dependency : metadata.requirements) {
-            if (!resolve(dependency)) {
-                return false;
-            }
-        }
 
         fs::path source_root;
-        if (!materialize_package_source(project, metadata, metadata_path, source_root)
-            || !import_package_targets(project, metadata, source_root, metadata_path)) {
+        PackageTargetInterface package_interface;
+        if (!materialize_package_source(project, candidate.metadata, candidate.metadata_path, source_root)
+            || !import_package_targets(
+                project, candidate.metadata, source_root, candidate.metadata_path, package_interface)) {
             return false;
         }
-
-        states[requirement.name] = PackageVisitState::Visited;
+        package_interfaces.emplace(std::string { package }, std::move(package_interface));
+        states[std::string { package }] = PackageVisitState::Visited;
         return true;
     };
 
     for (const auto& requirement : dependencies.requirements) {
-        if (!resolve(requirement)) {
+        if (!materialize_selected_package(requirement.name)) {
             return false;
         }
     }
 
-    if (lock.present && resolved_packages.size() != lock.packages.size()) {
-        std::println("Error: bspm.lock contains packages that are no longer required; remove bspm.lock to resolve again");
+    if (mode == PackageResolutionMode::UseLock && lock.present
+        && resolved_packages.size() != lock.packages.size()) {
+        std::println("Error: bspm.lock contains packages that are no longer required; run 'bspm update'");
         return false;
     }
-    if (!validate_project_dependencies(project)) {
+    if (!resolve_and_validate_project_dependencies(project, package_interfaces)) {
         return false;
     }
-    if (!lock.present
-        && !write_lock_config(project.root / LockFileName, registry_source, registry_revision, resolved_packages)) {
+    if ((mode != PackageResolutionMode::UseLock || !lock.present)
+        && !write_lock_config(lock_path, registry_source, registry_revision, resolved_packages)) {
         return false;
     }
     return true;
@@ -4970,6 +5794,11 @@ auto build_option_views(const std::vector<std::string>& options) -> std::vector<
 auto create_target_context(const ProjectConfig& project, const TargetConfig& target,
     std::span<const std::string_view> cli_options, Context& context) -> bool {
     static_cast<void>(project);
+#if defined(_WIN32) || defined(_WIN64)
+    context.output_name = "a.exe";
+#else
+    context.output_name = "a.out";
+#endif
     auto common_options = build_option_views(target.common_build_options);
     auto config_options = build_option_views(target.build_options);
     if (!apply_build_options(context, common_options, "bspm.build common options")) {
@@ -5339,6 +6168,34 @@ auto load_project_config_if_present(ProjectConfig& project, bool& present, fs::p
     return parse_project_config(config_path, project);
 }
 
+auto create_implicit_project(const fs::path& root, ProjectConfig& project) -> bool {
+    const auto absolute_root = fs::absolute(root).lexically_normal();
+    std::error_code ec;
+    if (!fs::is_directory(absolute_root, ec)) {
+        std::println("Error: '{}' is not a project directory", absolute_root.string());
+        return false;
+    }
+
+    project = {};
+    project.name = project_name_for(absolute_root);
+    project.default_target = "app";
+    project.root = absolute_root;
+    project.implicit_single_target = true;
+
+    TargetConfig target;
+    target.name = project.default_target;
+    target.path = ".";
+    target.build_options = { std::string { ExcludeOptTag }, ".bspm" };
+    project.targets.push_back(std::move(target));
+    return true;
+}
+
+auto dependency_manifest_present(const fs::path& root) -> bool {
+    std::error_code ec;
+    return fs::is_regular_file(fs::absolute(root) / DependenciesFileName, ec)
+        || fs::is_regular_file(fs::absolute(root) / ".dependencies", ec);
+}
+
 auto project_target_names(const ProjectConfig& project) -> std::vector<std::string_view> {
     std::vector<std::string_view> names;
     names.reserve(project.targets.size());
@@ -5354,6 +6211,250 @@ auto has_project_target(const ProjectConfig& project, std::string_view name) -> 
 
 auto contains_option(std::span<const std::string_view> options, std::string_view option) -> bool {
     return std::find(std::begin(options), std::end(options), option) != std::end(options);
+}
+
+auto read_text_file_if_present(const fs::path& path, bool& present, std::string& contents) -> bool {
+    std::error_code ec;
+    present = fs::exists(path, ec);
+    if (ec) {
+        std::println("Error: couldn't inspect '{}': {}", path.string(), ec.message());
+        return false;
+    }
+    if (!present) {
+        contents.clear();
+        return true;
+    }
+    if (!fs::is_regular_file(path, ec)) {
+        std::println("Error: '{}' is not a regular file", path.string());
+        return false;
+    }
+
+    std::ifstream file { path, std::ios::binary };
+    if (!file) {
+        std::println("Error: failed to open '{}'", path.string());
+        return false;
+    }
+    contents.assign(std::istreambuf_iterator<char> { file }, std::istreambuf_iterator<char> {});
+    return true;
+}
+
+auto restore_dependency_manifest(const fs::path& path, bool was_present, std::string_view contents) -> bool {
+    if (was_present) {
+        return write_text_file_atomically(path, contents, "dependency manifest");
+    }
+
+    std::error_code ec;
+    fs::remove(path, ec);
+    if (ec) {
+        std::println("Error: couldn't roll back dependency manifest '{}': {}", path.string(), ec.message());
+        return false;
+    }
+    return true;
+}
+
+auto remove_dependency_requirement(std::string_view contents, std::string_view package,
+    std::string& updated_contents, bool& removed) -> bool {
+    removed = false;
+    updated_contents.clear();
+    updated_contents.reserve(contents.size());
+
+    std::size_t cursor = 0;
+    std::size_t physical_line_number = 0;
+    while (cursor < contents.size()) {
+        const auto logical_start = cursor;
+        const auto logical_line_number = physical_line_number + 1;
+        std::string logical_line;
+        bool continued = false;
+        do {
+            const auto newline = contents.find('\n', cursor);
+            const auto line_end = newline == std::string_view::npos ? contents.size() : newline;
+            const auto physical_line = contents.substr(cursor, line_end - cursor);
+            cursor = newline == std::string_view::npos ? contents.size() : newline + 1;
+            ++physical_line_number;
+
+            const auto continuation = config_continuation_position(physical_line);
+            continued = continuation != std::string_view::npos;
+            if (continued) {
+                logical_line.append(physical_line.substr(0, continuation));
+                logical_line.push_back(' ');
+                if (cursor >= contents.size()) {
+                    std::println("Error: bspm.deps line {} ends with a continuation", logical_line_number);
+                    return false;
+                }
+            } else {
+                logical_line.append(physical_line);
+            }
+        } while (continued);
+
+        bool ok = true;
+        const auto tokens = tokenize_config_line(logical_line, logical_line_number, ok);
+        if (!ok) {
+            return false;
+        }
+        const bool matches = tokens.size() >= 2 && tokens[0] == "require" && tokens[1] == package;
+        if (matches) {
+            removed = true;
+        } else {
+            updated_contents.append(contents.substr(logical_start, cursor - logical_start));
+        }
+    }
+    return true;
+}
+
+auto add_project_dependency(ProjectConfig& project, std::string_view package, std::string_view version) -> bool {
+    const auto path = project.root / DependenciesFileName;
+    std::error_code ec;
+    if (!fs::exists(path, ec) && fs::is_regular_file(project.root / ".dependencies", ec)) {
+        std::println("Error: legacy .dependencies found; rename it to bspm.deps");
+        return false;
+    }
+
+    DependenciesConfig dependencies;
+    if (!parse_dependencies_config(path, dependencies)) {
+        return false;
+    }
+    if (std::any_of(dependencies.requirements.begin(), dependencies.requirements.end(),
+            [&](const auto& requirement) { return requirement.name == package; })) {
+        std::println("Error: package '{}' is already a direct requirement", package);
+        return false;
+    }
+
+    bool manifest_was_present = false;
+    std::string original_contents;
+    if (!read_text_file_if_present(path, manifest_was_present, original_contents)) {
+        return false;
+    }
+    std::string updated_contents = original_contents;
+    const std::string_view newline = original_contents.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+    if (!updated_contents.empty() && updated_contents.back() != '\n') {
+        updated_contents += newline;
+    }
+    updated_contents += "require ";
+    updated_contents += package;
+    if (!version.empty()) {
+        updated_contents.push_back(' ');
+        updated_contents += version;
+    }
+    updated_contents += newline;
+
+    if (!write_text_file_atomically(path, updated_contents, "dependency manifest")) {
+        return false;
+    }
+    if (prepare_project_packages(project, PackageResolutionMode::UpdatePackage, package)) {
+        return true;
+    }
+    if (!restore_dependency_manifest(path, manifest_was_present, original_contents)) {
+        std::println("Error: dependency resolution failed and bspm.deps could not be restored");
+    }
+    return false;
+}
+
+auto remove_project_dependency(ProjectConfig& project, std::string_view package) -> bool {
+    const auto path = project.root / DependenciesFileName;
+    std::error_code ec;
+    if (!fs::exists(path, ec) && fs::is_regular_file(project.root / ".dependencies", ec)) {
+        std::println("Error: legacy .dependencies found; rename it to bspm.deps");
+        return false;
+    }
+
+    DependenciesConfig dependencies;
+    if (!parse_dependencies_config(path, dependencies)) {
+        return false;
+    }
+    if (std::none_of(dependencies.requirements.begin(), dependencies.requirements.end(),
+            [&](const auto& requirement) { return requirement.name == package; })) {
+        std::println("Error: package '{}' is not a direct requirement", package);
+        return false;
+    }
+
+    bool manifest_was_present = false;
+    std::string original_contents;
+    if (!read_text_file_if_present(path, manifest_was_present, original_contents)) {
+        return false;
+    }
+    std::string updated_contents;
+    bool removed = false;
+    if (!remove_dependency_requirement(original_contents, package, updated_contents, removed)) {
+        return false;
+    }
+    if (!removed) {
+        std::println("Error: couldn't locate package '{}' in bspm.deps", package);
+        return false;
+    }
+
+    if (!write_text_file_atomically(path, updated_contents, "dependency manifest")) {
+        return false;
+    }
+    if (prepare_project_packages(project, PackageResolutionMode::ReconcileLock)) {
+        return true;
+    }
+    if (!restore_dependency_manifest(path, manifest_was_present, original_contents)) {
+        std::println("Error: dependency resolution failed and bspm.deps could not be restored");
+    }
+    return false;
+}
+
+struct DependencyCommandConfiguration {
+    fs::path project_root { fs::current_path() };
+    std::string package;
+    std::string version;
+};
+
+auto parse_dependency_command_configuration(
+    std::string_view command, int argc, char* argv[], DependencyCommandConfiguration& configuration) -> bool {
+    const bool accepts_package = command == UpdateTag || command == AddTag || command == RemoveTag;
+    const bool requires_package = command == AddTag || command == RemoveTag;
+    const bool accepts_version = command == AddTag;
+    bool saw_project_root = false;
+    for (int index = 2; index < argc; ++index) {
+        const std::string_view argument { argv[index] };
+        if (argument == ChangeDirectoryOptTag) {
+            if (saw_project_root || index + 1 >= argc) {
+                std::println("Error: {} expects one '-C <project-dir>' option", command);
+                return false;
+            }
+            configuration.project_root = argv[++index];
+            saw_project_root = true;
+            continue;
+        }
+        if (argument.starts_with('-')) {
+            std::println("Error: Invalid option '{}' for {} command", argument, command);
+            return false;
+        }
+        if (accepts_package && configuration.package.empty() && valid_package_name(argument)) {
+            configuration.package = argument;
+            continue;
+        }
+        if (accepts_version && configuration.version.empty() && !configuration.package.empty()) {
+            VersionConstraint constraint;
+            if (!parse_version_constraint(argument, constraint)) {
+                std::println("Error: invalid package constraint '{}'", argument);
+                return false;
+            }
+            configuration.version = argument;
+            continue;
+        }
+        {
+            std::println("Error: Invalid argument '{}' for {} command", argument, command);
+            return false;
+        }
+    }
+    if (requires_package && configuration.package.empty()) {
+        std::println("Error: {} expects a package name", command);
+        return false;
+    }
+    return true;
+}
+
+auto load_dependency_project(const fs::path& root, ProjectConfig& project) -> bool {
+    bool present = false;
+    if (!load_project_config_if_present(project, present, root)) {
+        if (present) {
+            return false;
+        }
+        return create_implicit_project(root, project);
+    }
+    return true;
 }
 
 int main(int argc, char* argv[]) {
@@ -5386,6 +6487,61 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         return doctor_command(context) ? 0 : 1;
+    }
+
+    if (command == InstallTag || command == UpdateTag || command == AddTag || command == RemoveTag) {
+        DependencyCommandConfiguration configuration;
+        if (!parse_dependency_command_configuration(command, argc, argv, configuration)) {
+            std::println("Type '{} help {}' for more description.", context.name, command);
+            return 1;
+        }
+
+        ProjectConfig dependency_project;
+        if (!load_dependency_project(configuration.project_root, dependency_project)) {
+            return 1;
+        }
+
+        if (command == InstallTag) {
+            if (!prepare_project_packages(dependency_project)) {
+                return 1;
+            }
+            std::println("installed dependencies for '{}'", dependency_project.root.string());
+            return 0;
+        }
+
+        if (command == AddTag) {
+            if (!add_project_dependency(dependency_project, configuration.package, configuration.version)) {
+                return 1;
+            }
+            if (configuration.version.empty()) {
+                std::println("added '{}' to bspm.deps", configuration.package);
+            } else {
+                std::println("added '{} {}' to bspm.deps", configuration.package, configuration.version);
+            }
+            return 0;
+        }
+
+        if (command == RemoveTag) {
+            if (!remove_project_dependency(dependency_project, configuration.package)) {
+                return 1;
+            }
+            std::println("removed '{}' from bspm.deps", configuration.package);
+            return 0;
+        }
+
+        const auto mode = configuration.package.empty()
+            ? PackageResolutionMode::UpdateAll
+            : PackageResolutionMode::UpdatePackage;
+        if (!prepare_project_packages(dependency_project, mode, configuration.package)) {
+            return 1;
+        }
+        if (configuration.package.empty()) {
+            std::println("updated all dependencies for '{}'", dependency_project.root.string());
+        } else {
+            std::println("updated '{}' and its dependency closure for '{}'", configuration.package,
+                dependency_project.root.string());
+        }
+        return 0;
     }
 
     ProjectConfig project;
@@ -5448,6 +6604,16 @@ int main(int argc, char* argv[]) {
             }
 
             return build_project(project, requested_targets, cli_options) ? 0 : 1;
+        }
+
+        const auto implicit_root = dir.empty() || subject == "all" ? fs::current_path() : dir;
+        if (dependency_manifest_present(implicit_root)) {
+            ProjectConfig implicit_project;
+            if (!create_implicit_project(implicit_root, implicit_project)) {
+                return 1;
+            }
+            const std::array<std::string_view, 1> requested_targets { implicit_project.default_target };
+            return build_project(implicit_project, requested_targets, cli_options) ? 0 : 1;
         }
 
         if (!init_context(context, BuildTag, { .argc = argc, .index = option_index, .argv = argv })) {
@@ -5513,6 +6679,16 @@ int main(int argc, char* argv[]) {
             return graph_project(project, requested_targets, cli_options) ? 0 : 1;
         }
 
+        const auto implicit_root = dir.empty() || subject == "all" ? fs::current_path() : dir;
+        if (dependency_manifest_present(implicit_root)) {
+            ProjectConfig implicit_project;
+            if (!create_implicit_project(implicit_root, implicit_project)) {
+                return 1;
+            }
+            const std::array<std::string_view, 1> requested_targets { implicit_project.default_target };
+            return graph_project(implicit_project, requested_targets, cli_options) ? 0 : 1;
+        }
+
         if (!init_context(context, GraphTag, { .argc = argc, .index = option_index, .argv = argv })) {
             std::println("Type '{} help {}' for more description.", context.name, GraphTag);
             return 1;
@@ -5574,6 +6750,16 @@ int main(int argc, char* argv[]) {
             }
 
             return compile_commands_project(project, requested_targets, cli_options) ? 0 : 1;
+        }
+
+        const auto implicit_root = dir.empty() || subject == "all" ? fs::current_path() : dir;
+        if (dependency_manifest_present(implicit_root)) {
+            ProjectConfig implicit_project;
+            if (!create_implicit_project(implicit_root, implicit_project)) {
+                return 1;
+            }
+            const std::array<std::string_view, 1> requested_targets { implicit_project.default_target };
+            return compile_commands_project(implicit_project, requested_targets, cli_options) ? 0 : 1;
         }
 
         if (!init_context(context, CompileCommandsTag, { .argc = argc, .index = option_index, .argv = argv })) {
