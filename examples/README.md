@@ -5,6 +5,7 @@ capability. Automated smoke coverage lives separately under `tests/`.
 
 | Example | Demonstrates | Build | Run |
 | --- | --- | --- | --- |
+| `simple` | An implicit single-folder project consuming fmt without `bspm.build` | `bspm build examples/simple` | `bspm run examples/simple` |
 | `module-dependencies` | Multiple module interfaces, module dependency sorting, and header-unit imports | `bspm build examples/module-dependencies` | `bspm run examples/module-dependencies` |
 | `header-unit` | Minimal executable with a standard-library header unit | `bspm build examples/header-unit` | `bspm run examples/header-unit` |
 | `nested-sources` | Recursive source discovery with nested `src/` and `modules/` folders | `bspm build examples/nested-sources` | `bspm run examples/nested-sources` |
@@ -18,6 +19,9 @@ capability. Automated smoke coverage lives separately under `tests/`.
 ## Notes
 
 - Add `-c g++`, `-c clang++`, or `-c msvc` to choose a compiler explicitly.
+- `simple` resolves fmt through `bspm.deps`, automatically attaches its default
+  target to the implicit application target, and formats its output with
+  `fmt::format`.
 - `nested-sources` is the example for nested source trees:
   ```text
   nested-sources/
@@ -41,7 +45,11 @@ capability. Automated smoke coverage lives separately under `tests/`.
   ```
 - `registry-package` resolves `fmt 12.2.0#0` through `bspm.deps`, writes a
   reproducible `bspm.lock`, caches its pinned Git source under `.bspm/`, and
-  links the registry's `fmt::fmt`
-  target into the example application. Its first build requires Git and network
-  access.
+  links the registry's `fmt::fmt` target into the example application. Its
+  first build requires Git and network
+  access. Run `bspm install -C examples/registry-package` to materialize the
+  dependency without building, or `bspm update fmt -C examples/registry-package`
+  to refresh its package closure. New requirements can be managed with
+  `bspm add <package> -C examples/registry-package` and `bspm remove <package>
+  -C examples/registry-package`.
 - Generated files are written under each target's `build/` directory.

@@ -220,7 +220,7 @@ configured `app` target.
 
 ## Registry packages
 
-Configured projects can consume exact, source-based packages from the central
+Both simple folders and configured projects can consume source-based packages from the central
 [`bspm-registry`](https://github.com/m1nuz/bspm-registry) or a local registry.
 Declare requirements in the project's `bspm.deps` file:
 
@@ -228,9 +228,28 @@ Declare requirements in the project's `bspm.deps` file:
 # Uses the central registry baseline.
 require fmt
 
-# Or pin the upstream and package-recipe versions explicitly.
+# Accept compatible 12.x releases.
+require fmt ^12.0.0
+
+# Intersect whitespace-separated comparisons.
+require spdlog >=1.14.0 <2.0.0
+
+# Or pin the upstream and package-recipe versions exactly.
 require fmt 12.2.0#0
 ```
+
+Package versions follow SemVer `major.minor.patch`, including standard
+prerelease and build identifiers. Requirements accept an exact version,
+`version#package-revision`, caret ranges (`^1.2.3`), tilde ranges (`~1.2.3`),
+or an intersection of `<`, `<=`, `>`, and `>=` comparisons. Compound ranges
+passed to `bspm add` should be quoted so the shell treats them as one argument:
+
+```console
+bspm add spdlog ">=1.14.0 <2.0.0"
+```
+
+An omitted constraint continues to select the registry baseline exactly.
+Package metadata uses the same syntax for transitive requirements.
 
 To use another Git registry or a local registry checkout, add one `registry`
 directive before the requirements:
@@ -240,8 +259,8 @@ registry ../my-registry
 require answer 1.0.0#0
 ```
 
-Registry packages expose namespaced targets. A consumer opts into the target in
-`bspm.build`:
+Registry packages expose namespaced targets. A consumer can always use the
+explicit `package::target` name in `bspm.build`:
 
 ```text
 project demo
@@ -250,8 +269,48 @@ default app
 target app app --bin -o demo --depends fmt::fmt
 ```
 
+A package can also declare its public interface in `package.bspm`:
+
+```text
+build registry build.bspm
+
+default-target fmt
+export-target fmt
+```
+
+`default-target` overrides the build recipe's default for the shorter `@package`
+dependency form, while repeated `export-target` directives restrict consumers
+to the listed recipe targets:
+
+```text
+target app app --bin -o demo --depends @fmt
+```
+
+The names in these directives are local build-recipe target names; `bspm`
+validates them when importing the package and expands `@fmt` to `fmt::fmt` before
+planning the project. When `package.bspm` omits `default-target`, `bspm` uses the
+validated `default` from the package's build recipe, including the automatic
+default of a single-target recipe. The effective default must also be exported
+when explicit exports are present. Package-internal dependencies may still use
+private targets. For compatibility, a package with no `export-target` directives
+exports every recipe target.
+
+For a simple project without `bspm.build`, every direct requirement is
+automatically attached to an implicit `app` target through its package default:
+
+```console
+cd examples/simple
+bspm add fmt
+bspm build
+bspm run
+```
+
+This implicit target covers the whole project folder and excludes `.bspm/` from
+source discovery. Configured projects continue to choose package dependencies
+per target with `--depends @package` or `--depends package::target`.
+
 When `build`, `graph`, or `compile-commands` plans the project, `bspm` resolves
-baseline or exact versions, validates `package.bspm`, checks out its full Git
+a single compatible version for every package, validates `package.bspm`, checks out its full Git
 `source-revision`, loads either its source-owned or registry-owned build recipe,
 and adds the recipe targets to the normal project dependency graph. Package
 sources and their build outputs are cached under `.bspm/packages/`; a remote
@@ -260,18 +319,59 @@ or registry must be fetched.
 
 After the first successful resolution, `bspm` writes `bspm.lock`. The lockfile
 pins the registry Git commit, every exact `version#package-revision`, and every
-package source commit. Later `build`, `graph`, and `compile-commands` operations
-restore and validate those revisions before using the registry. Commit both
+package source commit. Later `install`, `build`, `graph`, and `compile-commands`
+operations restore and validate those revisions before using the registry. Commit both
 `bspm.deps` and `bspm.lock`, but ignore `.bspm/`; newly initialized projects
 receive an appropriate `.gitignore` automatically. `bspm init` creates
 `bspm.deps`, but deliberately waits for a successful resolution before creating
 `bspm.lock`.
 
-The initial resolver accepts exact versions only. If requirements or the
-registry selection change, remove `bspm.lock` to resolve again; a dedicated
-update command is not yet implemented. Version ranges, archive sources, and
-binary packages are also not yet implemented. Registry recipes may use a
-trailing `\` to continue a directive on the next line.
+Install dependencies without building targets:
+
+```console
+bspm install
+bspm install -C path/to/project
+```
+
+`install` uses an existing lockfile exactly. If one does not exist, it refreshes
+the registry, resolves `bspm.deps`, and creates the lockfile.
+
+Refresh and rewrite the complete lockfile, or update one direct requirement and
+its transitive dependency closure:
+
+```console
+bspm update
+bspm update fmt
+bspm update fmt -C path/to/project
+```
+
+A named update selects the newest compatible versions in that package's
+transitive closure while preserving unrelated locked packages and moving the
+registry pin forward. Use a full `bspm update` after changing registries or when
+every dependency should be reconsidered. Resolution prefers newer compatible
+versions and backtracks when their transitive constraints conflict.
+
+Add or remove direct requirements without editing `bspm.deps` manually:
+
+```console
+bspm add fmt
+bspm add fmt ^12.0.0
+bspm add fmt 12.2.0#0
+bspm add fmt -C path/to/project
+bspm remove fmt
+```
+
+`add` preserves the existing manifest, appends one requirement, and resolves
+that package's dependency closure. `remove` deletes only the matching logical
+`require` directive and prunes packages that are no longer reachable. Both
+commands update `bspm.deps` and `bspm.lock` transactionally: a resolution or
+project-validation failure restores the manifest and leaves the previous lock
+unchanged. These commands work with or without `bspm.build`. A package cannot be
+removed while a configured target still depends on one of its namespaced targets.
+
+Exact versions explicitly pinned in `bspm.deps` remain fixed during updates.
+Archive sources and binary packages are not yet implemented. Registry recipes
+may use a trailing `\` to continue a directive on the next line.
 
 Generated files are kept under a profile-specific build directory:
 ```text
@@ -284,6 +384,10 @@ Generated files are kept under a profile-specific build directory:
 For GCC and Clang builds, `bspm` also writes compiler dependency files next to
 object files and uses them for incremental rebuild checks, so changes to quoted
 or included headers rebuild the affected source files.
+
+GCC header units such as `import <print>;` are cached under `gcm.cache` and
+reused while the compiler command remains unchanged. Changing compiler flags or
+removing the generated `.gcm` artifact rebuilds the header unit and its importer.
 
 Run executable
 ```console
