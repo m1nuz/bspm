@@ -359,6 +359,21 @@ def assert_cli_basics(bspm: Path, toolchain: Toolchain) -> None:
     install_help_result = run([bspm, "help", "install"])
     expect("bspm.lock" in install_help_result.stdout, "install help should describe locked installation")
 
+    search_help_result = run([bspm, "help", "search"])
+    expect("selected registry" in search_help_result.stdout, "search help should describe registry discovery")
+
+    info_help_result = run([bspm, "help", "info"])
+    expect("all registry versions" in info_help_result.stdout, "info help should describe package metadata")
+
+    outdated_help_result = run([bspm, "help", "outdated"])
+    expect("newest compatible solution" in outdated_help_result.stdout, "outdated help should describe comparison")
+
+    package_help_result = run([bspm, "help", "package"])
+    expect("package validate" in package_help_result.stdout, "package help should describe package validation")
+
+    registry_help_result = run([bspm, "help", "registry"])
+    expect("registry validate" in registry_help_result.stdout, "registry help should describe registry validation")
+
     update_help_result = run([bspm, "help", "update"])
     expect("[package]" in update_help_result.stdout, "update help should describe selective updates")
 
@@ -666,6 +681,23 @@ def assert_semantic_version_resolution(bspm: Path, workspace: Path) -> None:
         "intersected caret and tilde constraints should select the highest compatible leaf",
     )
 
+    search_result = run([bspm, "search", "LEA", "-C", consumer])
+    expect("PACKAGE\tBASELINE\tLATEST\tLOCKED" in search_result.stdout, "search should print version columns")
+    expect(
+        "leaf\t1.5.0#0\t2.0.0#0\t1.5.0#0" in search_result.stdout,
+        "search should be case-insensitive and show baseline, latest, and locked versions",
+    )
+
+    all_search_result = run([bspm, "search", "-C", consumer])
+    expect("addon\t2.0.0#0\t2.0.0#0\t-" in all_search_result.stdout, "empty search should list packages")
+
+    info_result = run([bspm, "info", "chooser", "-C", consumer])
+    expect("package: chooser" in info_result.stdout, "info should identify the requested package")
+    expect("2.0.0#0 [latest] [baseline]" in info_result.stdout, "info should label latest and baseline versions")
+    expect("leaf ^2.0.0" in info_result.stdout, "info should show transitive package requirements")
+    missing_info = run([bspm, "info", "missing", "-C", consumer], expected=1)
+    expect("was not found" in missing_info.stdout, "info should diagnose unknown packages")
+
     add_result = run([bspm, "add", "addon", "^1.0.0", "-C", consumer])
     expect("added 'addon ^1.0.0'" in add_result.stdout, "add should accept semantic-version constraints")
     expect("require addon ^1.0.0" in dependencies_path.read_text(), "add should preserve the requested constraint")
@@ -678,6 +710,22 @@ def assert_semantic_version_resolution(bspm: Path, workspace: Path) -> None:
 
     run([bspm, "install", "-C", consumer])
     expect(lock_path.read_text() == lock_after_add, "install should keep exact locked versions after registry updates")
+
+    lock_before_outdated = lock_path.read_text()
+    outdated_result = run([bspm, "outdated", "-C", consumer])
+    expect(
+        "PACKAGE\tCURRENT\tCOMPATIBLE\tLATEST\tCONSTRAINT" in outdated_result.stdout,
+        "outdated should print comparison columns",
+    )
+    expect(
+        "leaf\t1.5.0#0\t1.5.1#0\t2.0.0#0\t<transitive>" in outdated_result.stdout,
+        "outdated should distinguish compatible and unconstrained latest transitive versions",
+    )
+    expect(
+        "addon\t1.2.0#0\t1.2.0#0\t2.0.0#0\t^1.0.0" in outdated_result.stdout,
+        "outdated should show a direct constraint that blocks the latest version",
+    )
+    expect(lock_path.read_text() == lock_before_outdated, "outdated should not rewrite bspm.lock")
 
     addon_lock_line = next(line for line in lock_after_add.splitlines() if line.startswith("package addon "))
     run([bspm, "update", "narrow", "-C", consumer])
@@ -698,6 +746,88 @@ def assert_semantic_version_resolution(bspm: Path, workspace: Path) -> None:
         "conflict diagnostics should show the incompatible dependency chain",
     )
     expect(lock_path.read_text() == lock_before_conflict, "failed range resolution should preserve bspm.lock")
+
+
+def assert_package_registry_validation(bspm: Path, workspace: Path) -> None:
+    create_registry_package_fixture(workspace, suffix="-validation")
+    registry = workspace / "test-registry-validation"
+    source = workspace / "answer-package-source-validation"
+    package = registry / "packages" / "answer" / "1.0.0"
+    metadata_path = package / "package.bspm"
+
+    package_result = run([bspm, "package", "validate", package])
+    expect(
+        "validated package 'answer 1.0.0#0'" in package_result.stdout,
+        "package validate should accept a complete registry-owned recipe",
+    )
+
+    (source / "bspm.build").write_text((package / "build.bspm").read_text())
+    run(["git", "add", "bspm.build"], cwd=source)
+    run(["git", "commit", "-m", "Add source-owned package recipe"], cwd=source)
+    source_revision = run(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
+    metadata_lines = metadata_path.read_text().splitlines()
+    metadata_path.write_text(
+        "\n".join(
+            f"source-revision {source_revision}"
+            if line.startswith("source-revision ")
+            else "build source bspm.build"
+            if line == "build registry build.bspm"
+            else line
+            for line in metadata_lines
+        )
+        + "\n"
+    )
+
+    source_package_result = run([bspm, "package", "validate", metadata_path])
+    expect(
+        "validated package 'answer 1.0.0#0'" in source_package_result.stdout,
+        "package validate should load a build recipe from the pinned source revision",
+    )
+
+    registry_result = run([bspm, "registry", "validate", registry])
+    expect(
+        "1 packages, 1 versions" in registry_result.stdout,
+        "registry validate should report the validated package and version counts",
+    )
+
+    invalid_baseline = workspace / "invalid-baseline-registry"
+    shutil.copytree(registry, invalid_baseline, ignore=shutil.ignore_patterns(".git"))
+    (invalid_baseline / "baseline.bspm").write_text("package answer 2.0.0#0\n")
+    baseline_result = run([bspm, "registry", "validate", invalid_baseline], expected=1)
+    expect(
+        "does not reference an available package version" in baseline_result.stdout,
+        "registry validate should reject unavailable baseline references",
+    )
+
+    invalid_export = workspace / "invalid-export-registry"
+    shutil.copytree(registry, invalid_export, ignore=shutil.ignore_patterns(".git"))
+    invalid_metadata = invalid_export / "packages" / "answer" / "1.0.0" / "package.bspm"
+    invalid_metadata.write_text(invalid_metadata.read_text().replace("export-target answer", "export-target missing"))
+    export_result = run([bspm, "package", "validate", invalid_metadata], expected=1)
+    expect(
+        "export target 'missing' is not defined" in export_result.stdout,
+        "package validate should reject exports missing from the build recipe",
+    )
+
+    invalid_dependency = workspace / "invalid-dependency-registry"
+    shutil.copytree(registry, invalid_dependency, ignore=shutil.ignore_patterns(".git"))
+    dependency_metadata = invalid_dependency / "packages" / "answer" / "1.0.0" / "package.bspm"
+    dependency_metadata.write_text(dependency_metadata.read_text() + "require unavailable ^1.0.0\n")
+    dependency_result = run([bspm, "registry", "validate", invalid_dependency], expected=1)
+    expect(
+        "package is not present in the registry" in dependency_result.stdout,
+        "registry validate should reject unavailable package dependencies",
+    )
+
+    cyclic_dependency = workspace / "cyclic-dependency-registry"
+    shutil.copytree(registry, cyclic_dependency, ignore=shutil.ignore_patterns(".git"))
+    cyclic_metadata = cyclic_dependency / "packages" / "answer" / "1.0.0" / "package.bspm"
+    cyclic_metadata.write_text(cyclic_metadata.read_text() + "require answer 1.0.0#0\n")
+    cycle_result = run([bspm, "registry", "validate", cyclic_dependency], expected=1)
+    expect(
+        "cyclic package dependency involving 'answer'" in cycle_result.stdout,
+        "registry validate should reject package dependency cycles",
+    )
 
 
 def assert_gcc_header_unit_incremental_build(bspm: Path, workspace: Path, toolchain: Toolchain) -> None:
@@ -898,6 +1028,7 @@ def main() -> int:
         assert_generated_project_scaffolds(bspm, workspace)
         assert_dry_run_plans(bspm, workspace, toolchain)
         assert_semantic_version_resolution(bspm, workspace)
+        assert_package_registry_validation(bspm, workspace)
 
         if level == "full":
             assert_simple_binary(bspm, workspace, toolchain)

@@ -369,6 +369,53 @@ project-validation failure restores the manifest and leaves the previous lock
 unchanged. These commands work with or without `bspm.build`. A package cannot be
 removed while a configured target still depends on one of its namespaced targets.
 
+Inspect the project-selected registry without changing `bspm.deps` or
+`bspm.lock`:
+
+```console
+bspm search
+bspm search format
+bspm info fmt
+bspm outdated
+bspm outdated -C path/to/project
+```
+
+`search` performs a case-insensitive package-name search and shows each match's
+registry baseline, newest stable version, and current lock. `info` lists every
+available version together with its source, build recipe, target exports, and
+package requirements. Both commands use the registry selected by the project's
+`bspm.deps`, falling back to the central registry.
+
+`outdated` compares three exact package references: the current lock, the newest
+whole-graph solution allowed by all direct and transitive constraints, and the
+newest stable registry version. This makes it visible when `bspm update` can
+upgrade a package and when the latest version is blocked by a constraint. It
+refreshes the registry cache for the comparison but never rewrites the lockfile.
+
+Validate a package recipe before publishing it, or validate an entire registry
+checkout for CI:
+
+```console
+bspm package validate packages/fmt/12.2.0
+bspm package validate packages/fmt/12.2.0/package.bspm
+bspm registry validate .
+bspm registry validate path/to/bspm-registry
+```
+
+`package validate` finds the containing registry, verifies that the metadata's
+name and version match its `packages/<name>/<version>/package.bspm` location,
+resolves that exact version and its complete dependency graph, checks out every
+pinned source commit into a temporary directory, and validates source-owned or
+registry-owned build recipes, defaults, exports, target references, and package
+or target cycles.
+
+`registry validate` additionally checks `registry.bspm`, every baseline reference,
+every indexed package version, and every version's independently resolvable
+dependency graph. It exits nonzero on the first error and prints package/version
+counts on success, making it suitable for registry pull-request CI. Validation
+does not modify the registry and removes its temporary source cache afterward.
+It validates recipes structurally but does not compile package source code.
+
 Exact versions explicitly pinned in `bspm.deps` remain fixed during updates.
 Archive sources and binary packages are not yet implemented. Registry recipes
 may use a trailing `\` to continue a directive on the next line.
@@ -415,6 +462,11 @@ bspm help build
 bspm help graph
 bspm help compile-commands
 bspm help doctor
+bspm help search
+bspm help info
+bspm help outdated
+bspm help package
+bspm help registry
 ```
 
 See `examples/README.md` for a tour of the included example targets.
