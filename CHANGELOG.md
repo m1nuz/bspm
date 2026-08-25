@@ -12,6 +12,8 @@
 - Package commands and package-aware builds for simple single-folder projects without `bspm.build`.
 - Semantic-version constraints with exact, caret, tilde, and comparator-intersection syntax.
 - Deterministic highest-compatible dependency solving with backtracking and dependency-chain conflict diagnostics.
+- Read-only `bspm search`, `bspm info`, and `bspm outdated` registry inspection commands.
+- `bspm package validate` and `bspm registry validate` for local authoring checks and registry CI.
 - Git source caching under `.bspm/packages` and baseline resolution from `baseline.bspm`.
 - `.gitignore` scaffolding for generated `build/` and `.bspm/` caches.
 - `--public-include` usage requirements propagated transitively to consuming targets.

@@ -62,6 +62,12 @@ constexpr char InstallTag[] = "install";
 constexpr char UpdateTag[] = "update";
 constexpr char AddTag[] = "add";
 constexpr char RemoveTag[] = "remove";
+constexpr char SearchTag[] = "search";
+constexpr char InfoTag[] = "info";
+constexpr char OutdatedTag[] = "outdated";
+constexpr char PackageTag[] = "package";
+constexpr char RegistryTag[] = "registry";
+constexpr char ValidateTag[] = "validate";
 
 constexpr char GPPCompilerTag[] = "g++";
 constexpr char GCCCompilerTag[] = "gcc";
@@ -83,6 +89,11 @@ std::string_view commands[] {
     UpdateTag,
     AddTag,
     RemoveTag,
+    SearchTag,
+    InfoTag,
+    OutdatedTag,
+    PackageTag,
+    RegistryTag,
     GraphTag,
     CompileCommandsTag,
     RunTag,
@@ -1322,6 +1333,46 @@ auto help_command(Context& context, std::string_view command) -> void {
         std::println("\t{} {} <package> [-C <project-dir>]", context.name, RemoveTag);
         std::println("");
         std::println("Remove a direct requirement and prune packages no longer reachable from bspm.lock.");
+        return;
+    }
+
+    if (command == SearchTag) {
+        std::println("Usage:");
+        std::println("\t{} {} [query] [-C <project-dir>]", context.name, SearchTag);
+        std::println("");
+        std::println("Search the selected registry and show baseline, latest, and locked versions.");
+        return;
+    }
+
+    if (command == InfoTag) {
+        std::println("Usage:");
+        std::println("\t{} {} <package> [-C <project-dir>]", context.name, InfoTag);
+        std::println("");
+        std::println("Show all registry versions and metadata for a package.");
+        return;
+    }
+
+    if (command == OutdatedTag) {
+        std::println("Usage:");
+        std::println("\t{} {} [-C <project-dir>]", context.name, OutdatedTag);
+        std::println("");
+        std::println("Compare bspm.lock with the newest compatible solution and newest registry versions.");
+        return;
+    }
+
+    if (command == PackageTag) {
+        std::println("Usage:");
+        std::println("\t{} {} {} [package-dir|package.bspm]", context.name, PackageTag, ValidateTag);
+        std::println("");
+        std::println("Validate one registry package version, its dependency solution, source, and build recipe.");
+        return;
+    }
+
+    if (command == RegistryTag) {
+        std::println("Usage:");
+        std::println("\t{} {} {} [registry-dir]", context.name, RegistryTag, ValidateTag);
+        std::println("");
+        std::println("Validate registry configuration, baselines, package versions, dependencies, and recipes.");
         return;
     }
 
@@ -4333,7 +4384,7 @@ auto compare_numeric_identifiers(std::string_view left, std::string_view right) 
 }
 
 auto compare_semantic_versions(const SemanticVersion& left, const SemanticVersion& right) -> int {
-    for (const auto [lhs, rhs] : std::array {
+    for (const auto& [lhs, rhs] : std::array {
              std::pair { left.major, right.major },
              std::pair { left.minor, right.minor },
              std::pair { left.patch, right.patch },
@@ -4878,6 +4929,11 @@ auto parse_package_metadata(const fs::path& path, PackageMetadata& metadata) -> 
                 == metadata.export_targets.end()) {
             metadata.export_targets.push_back(tokens[1]);
         } else if (tokens[0] == "require" && tokens.size() >= 2 && valid_package_name(tokens[1])) {
+            if (std::any_of(metadata.requirements.begin(), metadata.requirements.end(),
+                    [&](const auto& requirement) { return requirement.name == tokens[1]; })) {
+                std::println("Error: package '{}' is required more than once in '{}'", tokens[1], path.string());
+                return false;
+            }
             auto constraint_text = join_version_constraint_tokens(tokens, 2);
             if (!constraint_text.empty()) {
                 VersionConstraint constraint;
@@ -5334,6 +5390,14 @@ struct PackageResolutionFailure {
     std::string message;
 };
 
+struct PackageResolutionSnapshot {
+    fs::path registry_root;
+    std::string registry_source;
+    std::string registry_revision;
+    std::unordered_map<std::string, std::string> baseline;
+    std::unordered_map<std::string, LockedPackage> packages;
+};
+
 auto package_reference(const RegistryPackageCandidate& candidate) -> std::string {
     return candidate.metadata.version + "#" + std::to_string(candidate.metadata.package_revision);
 }
@@ -5343,13 +5407,17 @@ auto load_registry_package_candidates(const fs::path& registry_root, std::string
     candidates.clear();
     const auto package_root = registry_root / "packages" / fs::path { package };
     std::error_code ec;
-    const auto root_exists = fs::is_directory(package_root, ec);
+    const auto root_exists = fs::exists(package_root, ec);
     if (ec) {
         std::println("Error: couldn't inspect registry package '{}': {}", package_root.string(), ec.message());
         return false;
     }
     if (!root_exists) {
         return true;
+    }
+    if (!fs::is_directory(package_root, ec) || ec) {
+        std::println("Error: registry package path '{}' is not a directory", package_root.string());
+        return false;
     }
 
     for (fs::directory_iterator it { package_root, fs::directory_options::skip_permission_denied, ec }, end;
@@ -5459,7 +5527,7 @@ auto record_package_resolution_failure(PackageResolutionFailure& failure, std::s
 }
 
 auto prepare_project_packages(ProjectConfig& project, PackageResolutionMode mode = PackageResolutionMode::UseLock,
-    std::string_view update_package = {}) -> bool {
+    std::string_view update_package = {}, PackageResolutionSnapshot* snapshot = nullptr) -> bool {
     const auto dependencies_path = project.root / DependenciesFileName;
     const auto lock_path = project.root / LockFileName;
     std::error_code dependency_ec;
@@ -5702,6 +5770,27 @@ auto prepare_project_packages(ProjectConfig& project, PackageResolutionMode mode
             std::println("Error: {}", resolution_failure.message);
         }
         return false;
+    }
+
+    if (snapshot) {
+        snapshot->registry_root = registry_root;
+        snapshot->registry_source = registry_source;
+        snapshot->registry_revision = registry_revision;
+        snapshot->baseline = baseline;
+        snapshot->packages.clear();
+        for (const auto& [package, selected] : solved_state.selections) {
+            const auto cached = candidate_cache.find(package);
+            if (cached == candidate_cache.end() || selected >= cached->second.size()) {
+                std::println("Error: internal resolver error: package '{}' was not selected", package);
+                return false;
+            }
+            const auto& candidate = cached->second[selected];
+            snapshot->packages.emplace(package, LockedPackage {
+                .reference = package_reference(candidate),
+                .source_revision = candidate.metadata.source_revision,
+            });
+        }
+        return true;
     }
 
     enum class PackageVisitState { Visiting, Visited };
@@ -6402,8 +6491,10 @@ struct DependencyCommandConfiguration {
 
 auto parse_dependency_command_configuration(
     std::string_view command, int argc, char* argv[], DependencyCommandConfiguration& configuration) -> bool {
-    const bool accepts_package = command == UpdateTag || command == AddTag || command == RemoveTag;
-    const bool requires_package = command == AddTag || command == RemoveTag;
+    const bool accepts_package = command == UpdateTag || command == AddTag || command == RemoveTag
+        || command == InfoTag;
+    const bool accepts_query = command == SearchTag;
+    const bool requires_package = command == AddTag || command == RemoveTag || command == InfoTag;
     const bool accepts_version = command == AddTag;
     bool saw_project_root = false;
     for (int index = 2; index < argc; ++index) {
@@ -6422,6 +6513,10 @@ auto parse_dependency_command_configuration(
             return false;
         }
         if (accepts_package && configuration.package.empty() && valid_package_name(argument)) {
+            configuration.package = argument;
+            continue;
+        }
+        if (accepts_query && configuration.package.empty()) {
             configuration.package = argument;
             continue;
         }
@@ -6453,6 +6548,760 @@ auto load_dependency_project(const fs::path& root, ProjectConfig& project) -> bo
             return false;
         }
         return create_implicit_project(root, project);
+    }
+    return true;
+}
+
+struct RegistryInspection {
+    DependenciesConfig dependencies;
+    LockConfig lock;
+    fs::path root;
+    std::string source;
+    std::string revision;
+    std::unordered_map<std::string, std::string> baseline;
+};
+
+auto load_registry_inspection(const ProjectConfig& project, RegistryInspection& inspection) -> bool {
+    const auto dependencies_path = project.root / DependenciesFileName;
+    std::error_code ec;
+    if (!fs::exists(dependencies_path, ec)
+        && fs::is_regular_file(project.root / ".dependencies", ec)) {
+        std::println("Error: legacy .dependencies found; rename it to bspm.deps");
+        return false;
+    }
+    if (!parse_dependencies_config(dependencies_path, inspection.dependencies)
+        || !parse_lock_config(project.root / LockFileName, inspection.lock)) {
+        return false;
+    }
+    if (!materialize_registry(project, inspection.dependencies.registry, {}, inspection.root, inspection.source,
+            inspection.revision)) {
+        return false;
+    }
+    return parse_registry_baseline(inspection.root, inspection.baseline);
+}
+
+auto registry_package_names(const fs::path& registry_root, std::vector<std::string>& names) -> bool {
+    names.clear();
+    const auto packages_root = registry_root / "packages";
+    std::error_code ec;
+    if (!fs::is_directory(packages_root, ec)) {
+        if (ec) {
+            std::println("Error: couldn't inspect registry packages '{}': {}", packages_root.string(), ec.message());
+            return false;
+        }
+        return true;
+    }
+
+    for (fs::recursive_directory_iterator it {
+             packages_root, fs::directory_options::skip_permission_denied, ec }, end;
+        !ec && it != end; it.increment(ec)) {
+        std::error_code entry_ec;
+        if (!it->is_regular_file(entry_ec) || it->path().filename() != "package.bspm") {
+            continue;
+        }
+
+        const auto version_root = it->path().parent_path();
+        SemanticVersion version;
+        if (!parse_semantic_version(version_root.filename().string(), version)) {
+            continue;
+        }
+        std::error_code relative_ec;
+        const auto relative_package = fs::relative(version_root.parent_path(), packages_root, relative_ec);
+        if (relative_ec) {
+            std::println("Error: couldn't inspect registry package '{}': {}", it->path().string(),
+                relative_ec.message());
+            return false;
+        }
+        const auto name = relative_package.generic_string();
+        if (valid_package_name(name)) {
+            names.push_back(name);
+        }
+    }
+    if (ec) {
+        std::println("Error: couldn't inspect registry packages '{}': {}", packages_root.string(), ec.message());
+        return false;
+    }
+
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    return true;
+}
+
+auto case_insensitive_contains(std::string_view text, std::string_view query) -> bool {
+    std::string folded_text { text };
+    std::string folded_query { query };
+    const auto fold = [](char ch) { return static_cast<char>(std::tolower(static_cast<unsigned char>(ch))); };
+    std::transform(folded_text.begin(), folded_text.end(), folded_text.begin(), fold);
+    std::transform(folded_query.begin(), folded_query.end(), folded_query.begin(), fold);
+    return folded_text.find(folded_query) != std::string::npos;
+}
+
+auto latest_registry_candidate(const std::vector<RegistryPackageCandidate>& candidates)
+    -> const RegistryPackageCandidate* {
+    const auto stable = std::find_if(candidates.begin(), candidates.end(), [](const auto& candidate) {
+        return candidate.semantic_version.prerelease.empty();
+    });
+    if (stable != candidates.end()) {
+        return &*stable;
+    }
+    return candidates.empty() ? nullptr : &candidates.front();
+}
+
+auto search_packages_command(const ProjectConfig& project, std::string_view query) -> bool {
+    RegistryInspection inspection;
+    if (!load_registry_inspection(project, inspection)) {
+        return false;
+    }
+
+    std::vector<std::string> names;
+    if (!registry_package_names(inspection.root, names)) {
+        return false;
+    }
+
+    std::println("registry: {}", inspection.source);
+    std::println("PACKAGE\tBASELINE\tLATEST\tLOCKED");
+    std::size_t matches = 0;
+    for (const auto& name : names) {
+        if (!case_insensitive_contains(name, query)) {
+            continue;
+        }
+        std::vector<RegistryPackageCandidate> candidates;
+        if (!load_registry_package_candidates(inspection.root, name, candidates)) {
+            return false;
+        }
+        const auto* latest = latest_registry_candidate(candidates);
+        const auto baseline = inspection.baseline.find(name);
+        const auto locked = inspection.lock.packages.find(name);
+        std::println("{}\t{}\t{}\t{}", name,
+            baseline == inspection.baseline.end() ? "-" : baseline->second,
+            latest ? package_reference(*latest) : "-",
+            locked == inspection.lock.packages.end() ? "-" : locked->second.reference);
+        ++matches;
+    }
+    if (matches == 0) {
+        std::println("No packages match '{}'.", query);
+    }
+    return true;
+}
+
+auto info_package_command(const ProjectConfig& project, std::string_view package) -> bool {
+    RegistryInspection inspection;
+    if (!load_registry_inspection(project, inspection)) {
+        return false;
+    }
+
+    std::vector<RegistryPackageCandidate> candidates;
+    if (!load_registry_package_candidates(inspection.root, package, candidates)) {
+        return false;
+    }
+    if (candidates.empty()) {
+        std::println("Error: package '{}' was not found in registry '{}'", package, inspection.source);
+        return false;
+    }
+
+    const auto* latest = latest_registry_candidate(candidates);
+    const auto baseline = inspection.baseline.find(std::string { package });
+    const auto locked = inspection.lock.packages.find(std::string { package });
+    std::println("package: {}", package);
+    std::println("registry: {}", inspection.source);
+    std::println("baseline: {}", baseline == inspection.baseline.end() ? "-" : baseline->second);
+    std::println("latest: {}", latest ? package_reference(*latest) : "-");
+    std::println("locked: {}", locked == inspection.lock.packages.end() ? "-" : locked->second.reference);
+    std::println("versions:");
+    for (const auto& candidate : candidates) {
+        const auto reference = package_reference(candidate);
+        std::print("  {}", reference);
+        if (latest == &candidate) {
+            std::print(" [latest]");
+        }
+        if (baseline != inspection.baseline.end() && baseline->second == reference) {
+            std::print(" [baseline]");
+        }
+        if (locked != inspection.lock.packages.end() && locked->second.reference == reference) {
+            std::print(" [locked]");
+        }
+        std::println("");
+        std::println("    source: {} {}", candidate.metadata.source_kind, candidate.metadata.source);
+        std::println("    source-revision: {}", candidate.metadata.source_revision);
+        std::println("    build: {} {}", candidate.metadata.build_location,
+            candidate.metadata.build_manifest.generic_string());
+        std::println("    default-target: {}", candidate.metadata.default_target.empty()
+                ? "<build recipe default>"
+                : candidate.metadata.default_target);
+        if (candidate.metadata.export_targets.empty()) {
+            std::println("    export-targets: <all build recipe targets>");
+        } else {
+            std::print("    export-targets:");
+            for (const auto& target : candidate.metadata.export_targets) {
+                std::print(" {}", target);
+            }
+            std::println("");
+        }
+        if (candidate.metadata.requirements.empty()) {
+            std::println("    requires: <none>");
+        } else {
+            std::println("    requires:");
+            for (const auto& requirement : candidate.metadata.requirements) {
+                std::println("      {} {}", requirement.name,
+                    requirement.version.empty() ? "<registry baseline>" : requirement.version);
+            }
+        }
+    }
+    return true;
+}
+
+struct OutdatedPackageRow {
+    std::string name;
+    std::string current;
+    std::string compatible;
+    std::string latest;
+    std::string constraint;
+};
+
+auto outdated_packages_command(ProjectConfig project) -> bool {
+    DependenciesConfig dependencies;
+    LockConfig lock;
+    if (!parse_dependencies_config(project.root / DependenciesFileName, dependencies)
+        || !parse_lock_config(project.root / LockFileName, lock)) {
+        return false;
+    }
+    if (dependencies.requirements.empty()) {
+        std::println("No dependencies are declared in bspm.deps.");
+        return true;
+    }
+    if (!lock.present) {
+        std::println("Error: bspm.lock is missing; run 'bspm install' first");
+        return false;
+    }
+
+    PackageResolutionSnapshot snapshot;
+    if (!prepare_project_packages(project, PackageResolutionMode::UpdateAll, {}, &snapshot)) {
+        return false;
+    }
+
+    std::unordered_map<std::string, std::string> direct_constraints;
+    for (const auto& requirement : dependencies.requirements) {
+        if (requirement.version.empty()) {
+            const auto baseline = snapshot.baseline.find(requirement.name);
+            direct_constraints[requirement.name] = baseline == snapshot.baseline.end()
+                ? "baseline"
+                : "baseline (" + baseline->second + ")";
+        } else {
+            direct_constraints[requirement.name] = requirement.version;
+        }
+    }
+
+    std::vector<std::string> names;
+    names.reserve(lock.packages.size() + snapshot.packages.size());
+    for (const auto& [name, package] : lock.packages) {
+        static_cast<void>(package);
+        names.push_back(name);
+    }
+    for (const auto& [name, package] : snapshot.packages) {
+        static_cast<void>(package);
+        names.push_back(name);
+    }
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+
+    std::vector<OutdatedPackageRow> rows;
+    for (const auto& name : names) {
+        const auto current_package = lock.packages.find(name);
+        const auto compatible_package = snapshot.packages.find(name);
+        const auto current = current_package == lock.packages.end() ? "-" : current_package->second.reference;
+        const auto compatible
+            = compatible_package == snapshot.packages.end() ? "-" : compatible_package->second.reference;
+
+        std::vector<RegistryPackageCandidate> candidates;
+        if (!load_registry_package_candidates(snapshot.registry_root, name, candidates)) {
+            return false;
+        }
+        const auto* latest_candidate = latest_registry_candidate(candidates);
+        const auto latest = latest_candidate ? package_reference(*latest_candidate) : "-";
+        if (current == latest && current == compatible) {
+            continue;
+        }
+
+        const auto direct = direct_constraints.find(name);
+        rows.push_back({
+            .name = name,
+            .current = current,
+            .compatible = compatible,
+            .latest = latest,
+            .constraint = direct != direct_constraints.end()
+                ? direct->second
+                : compatible_package == snapshot.packages.end() ? "<not required>" : "<transitive>",
+        });
+    }
+
+    if (rows.empty()) {
+        std::println("All dependencies are up to date.");
+        return true;
+    }
+    std::println("PACKAGE\tCURRENT\tCOMPATIBLE\tLATEST\tCONSTRAINT");
+    for (const auto& row : rows) {
+        std::println("{}\t{}\t{}\t{}\t{}", row.name, row.current, row.compatible, row.latest, row.constraint);
+    }
+    return true;
+}
+
+struct PackageValidationRegistry {
+    fs::path root;
+    std::unordered_map<std::string, std::string> baseline;
+    std::unordered_map<std::string, std::vector<RegistryPackageCandidate>> candidates;
+};
+
+struct ValidationTemporaryRoot {
+    fs::path path;
+
+    ValidationTemporaryRoot(const ValidationTemporaryRoot&) = delete;
+    auto operator=(const ValidationTemporaryRoot&) -> ValidationTemporaryRoot& = delete;
+    ValidationTemporaryRoot() = default;
+
+    ~ValidationTemporaryRoot() {
+        if (!path.empty()) {
+            std::error_code ec;
+            fs::remove_all(path, ec);
+        }
+    }
+};
+
+auto create_validation_temporary_root(ValidationTemporaryRoot& temporary) -> bool {
+    std::error_code ec;
+    const auto base = fs::temp_directory_path(ec);
+    if (ec) {
+        std::println("Error: couldn't locate the temporary directory: {}", ec.message());
+        return false;
+    }
+
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    for (std::size_t attempt = 0; attempt < 16; ++attempt) {
+        auto candidate = base / std::format("bspm-validation-{}-{}", nonce, attempt);
+        ec.clear();
+        if (fs::create_directory(candidate, ec)) {
+            temporary.path = fs::absolute(candidate).lexically_normal();
+            return true;
+        }
+        if (ec) {
+            std::println("Error: couldn't create validation directory '{}': {}", candidate.string(), ec.message());
+            return false;
+        }
+    }
+    std::println("Error: couldn't create a unique validation directory under '{}'", base.string());
+    return false;
+}
+
+auto normalize_registry_root(const fs::path& argument, fs::path& root) -> bool {
+    root = fs::absolute(argument).lexically_normal();
+    std::error_code ec;
+    if (fs::is_regular_file(root, ec) && root.filename() == "registry.bspm") {
+        root = root.parent_path();
+    }
+    ec.clear();
+    if (!fs::is_directory(root, ec)) {
+        std::println("Error: '{}' is not a registry directory", root.string());
+        return false;
+    }
+    return true;
+}
+
+auto initialize_package_validation_registry(const fs::path& root, PackageValidationRegistry& registry) -> bool {
+    if (!normalize_registry_root(root, registry.root) || !validate_registry_config(registry.root)
+        || !parse_registry_baseline(registry.root, registry.baseline)) {
+        return false;
+    }
+    return true;
+}
+
+auto validation_candidates_for(PackageValidationRegistry& registry, std::string_view package)
+    -> std::vector<RegistryPackageCandidate>* {
+    auto cached = registry.candidates.find(std::string { package });
+    if (cached != registry.candidates.end()) {
+        return &cached->second;
+    }
+
+    std::vector<RegistryPackageCandidate> candidates;
+    if (!load_registry_package_candidates(registry.root, package, candidates)) {
+        return nullptr;
+    }
+    return &registry.candidates.emplace(std::string { package }, std::move(candidates)).first->second;
+}
+
+auto package_metadata_path_from_argument(const fs::path& argument, fs::path& metadata_path) -> bool {
+    metadata_path = fs::absolute(argument).lexically_normal();
+    std::error_code ec;
+    if (fs::is_directory(metadata_path, ec)) {
+        metadata_path /= "package.bspm";
+    }
+    ec.clear();
+    if (!fs::is_regular_file(metadata_path, ec) || metadata_path.filename() != "package.bspm") {
+        std::println("Error: '{}' is not a package.bspm file or package version directory", argument.string());
+        return false;
+    }
+    return true;
+}
+
+auto find_package_registry_root(const fs::path& metadata_path, fs::path& registry_root) -> bool {
+    auto current = metadata_path.parent_path();
+    while (!current.empty()) {
+        std::error_code ec;
+        if (fs::is_regular_file(current / "registry.bspm", ec)) {
+            registry_root = current;
+            return true;
+        }
+        const auto parent = current.parent_path();
+        if (parent == current) {
+            break;
+        }
+        current = parent;
+    }
+    std::println("Error: package '{}' is not inside a registry containing registry.bspm", metadata_path.string());
+    return false;
+}
+
+auto validate_package_metadata_placement(const fs::path& registry_root, const fs::path& metadata_path,
+    const PackageMetadata& metadata) -> bool {
+    const auto expected_path = fs::absolute(
+        registry_root / "packages" / fs::path { metadata.name } / metadata.version / "package.bspm")
+                                   .lexically_normal();
+    std::error_code ec;
+    if (!fs::equivalent(metadata_path, expected_path, ec)) {
+        std::println("Error: package metadata '{}' declares '{} {}' but must be stored at '{}'", metadata_path.string(),
+            metadata.name, metadata.version, expected_path.string());
+        return false;
+    }
+    return true;
+}
+
+auto resolve_validation_package_solution(PackageValidationRegistry& registry, const PackageRequirement& root,
+    PackageSolverState& solved_state) -> bool {
+    PackageResolutionFailure failure;
+    bool resolver_error = false;
+
+    std::function<bool(PackageSolverState, std::vector<PendingPackageRequirement>)> solve_packages
+        = [&](PackageSolverState state, std::vector<PendingPackageRequirement> pending) -> bool {
+        if (pending.empty()) {
+            solved_state = std::move(state);
+            return true;
+        }
+
+        auto current = std::move(pending.back());
+        pending.pop_back();
+
+        std::string constraint_text;
+        if (!package_constraint_text(current.requirement, registry.baseline, constraint_text)) {
+            PackageConstraintSource source { .constraint = {}, .path = current.path };
+            source.constraint.text = "<registry baseline>";
+            state.constraints[current.requirement.name].push_back(std::move(source));
+            record_package_resolution_failure(failure, current.requirement.name,
+                state.constraints[current.requirement.name], "no requested version or registry baseline");
+            return false;
+        }
+
+        VersionConstraint constraint;
+        if (!parse_version_constraint(constraint_text, constraint)) {
+            PackageConstraintSource source { .constraint = {}, .path = current.path };
+            source.constraint.text = constraint_text;
+            state.constraints[current.requirement.name].push_back(std::move(source));
+            record_package_resolution_failure(failure, current.requirement.name,
+                state.constraints[current.requirement.name], "invalid semantic-version constraint");
+            return false;
+        }
+        state.constraints[current.requirement.name].push_back({
+            .constraint = std::move(constraint),
+            .path = current.path,
+        });
+
+        auto* candidates = validation_candidates_for(registry, current.requirement.name);
+        if (!candidates) {
+            resolver_error = true;
+            return false;
+        }
+        const auto& constraints = state.constraints.at(current.requirement.name);
+        if (const auto selected = state.selections.find(current.requirement.name);
+            selected != state.selections.end()) {
+            if (selected->second < candidates->size()
+                && candidate_satisfies_constraints((*candidates)[selected->second], constraints)) {
+                return solve_packages(std::move(state), std::move(pending));
+            }
+            record_package_resolution_failure(failure, current.requirement.name, constraints,
+                "selected versions have incompatible requirements");
+            return false;
+        }
+
+        for (std::size_t candidate_index = 0; candidate_index < candidates->size(); ++candidate_index) {
+            const auto& candidate = (*candidates)[candidate_index];
+            if (!candidate_satisfies_constraints(candidate, constraints)) {
+                continue;
+            }
+
+            auto branch = state;
+            branch.selections[current.requirement.name] = candidate_index;
+            auto branch_pending = pending;
+            auto dependency_path = current.path;
+            dependency_path.push_back(current.requirement.name);
+            for (auto dependency = candidate.metadata.requirements.rbegin();
+                dependency != candidate.metadata.requirements.rend(); ++dependency) {
+                branch_pending.push_back({
+                    .requirement = *dependency,
+                    .path = dependency_path,
+                });
+            }
+            if (solve_packages(std::move(branch), std::move(branch_pending))) {
+                return true;
+            }
+            if (resolver_error) {
+                return false;
+            }
+        }
+
+        record_package_resolution_failure(failure, current.requirement.name, constraints,
+            candidates->empty() ? "package is not present in the registry"
+                                : "no available version satisfies all constraints");
+        return false;
+    };
+
+    std::vector<PendingPackageRequirement> pending {
+        { .requirement = root, .path = { "package " + root.name } }
+    };
+    if (solve_packages({}, std::move(pending))) {
+        return true;
+    }
+    if (!resolver_error) {
+        std::println("Error: {}", failure.message);
+    }
+    return false;
+}
+
+auto validate_package_solution(PackageValidationRegistry& registry, const PackageRequirement& root,
+    const fs::path& temporary_root) -> bool {
+    PackageSolverState solved_state;
+    if (!resolve_validation_package_solution(registry, root, solved_state)) {
+        return false;
+    }
+
+    ProjectConfig project;
+    project.name = "package-validation";
+    project.root = temporary_root;
+    PackageTargetInterfaces package_interfaces;
+    enum class PackageVisitState { Visiting, Visited };
+    std::unordered_map<std::string, PackageVisitState> states;
+
+    std::function<bool(std::string_view)> import_package = [&](std::string_view package) {
+        if (const auto state = states.find(std::string { package }); state != states.end()) {
+            if (state->second == PackageVisitState::Visiting) {
+                std::println("Error: cyclic package dependency involving '{}'", package);
+                return false;
+            }
+            return true;
+        }
+        states[std::string { package }] = PackageVisitState::Visiting;
+
+        const auto selected = solved_state.selections.find(std::string { package });
+        auto* candidates = validation_candidates_for(registry, package);
+        if (selected == solved_state.selections.end() || !candidates || selected->second >= candidates->size()) {
+            std::println("Error: internal validation resolver error for package '{}'", package);
+            return false;
+        }
+        const auto& candidate = (*candidates)[selected->second];
+        for (const auto& dependency : candidate.metadata.requirements) {
+            if (!import_package(dependency.name)) {
+                return false;
+            }
+        }
+
+        fs::path source_root;
+        PackageTargetInterface package_interface;
+        if (!materialize_package_source(project, candidate.metadata, candidate.metadata_path, source_root)
+            || !import_package_targets(
+                project, candidate.metadata, source_root, candidate.metadata_path, package_interface)) {
+            return false;
+        }
+        package_interfaces.emplace(std::string { package }, std::move(package_interface));
+        states[std::string { package }] = PackageVisitState::Visited;
+        return true;
+    };
+
+    if (!import_package(root.name) || !resolve_and_validate_project_dependencies(project, package_interfaces)) {
+        return false;
+    }
+    for (const auto& target : project.targets) {
+        std::error_code ec;
+        if (!fs::exists(target.path, ec)) {
+            std::println("Error: package target '{}' uses missing source path '{}'", target.name,
+                target.path.string());
+            return false;
+        }
+    }
+
+    const auto target_names = project_target_names(project);
+    std::vector<const TargetConfig*> order;
+    return collect_project_build_order(project, target_names, order);
+}
+
+auto package_validate_command(const fs::path& argument) -> bool {
+    fs::path metadata_path;
+    fs::path registry_root;
+    if (!package_metadata_path_from_argument(argument, metadata_path)
+        || !find_package_registry_root(metadata_path, registry_root)) {
+        return false;
+    }
+
+    PackageMetadata metadata;
+    if (!parse_package_metadata(metadata_path, metadata)
+        || !validate_package_metadata_placement(registry_root, metadata_path, metadata)) {
+        return false;
+    }
+
+    PackageValidationRegistry registry;
+    if (!initialize_package_validation_registry(registry_root, registry)) {
+        return false;
+    }
+    auto* candidates = validation_candidates_for(registry, metadata.name);
+    const auto reference = metadata.version + "#" + std::to_string(metadata.package_revision);
+    if (!candidates || std::none_of(candidates->begin(), candidates->end(), [&](const auto& candidate) {
+            return package_reference(candidate) == reference;
+        })) {
+        std::println("Error: package '{} {}' is not indexed by its registry", metadata.name, reference);
+        return false;
+    }
+
+    ValidationTemporaryRoot temporary;
+    if (!create_validation_temporary_root(temporary)
+        || !validate_package_solution(registry, { .name = metadata.name, .version = reference }, temporary.path)) {
+        return false;
+    }
+    std::println("validated package '{} {}'", metadata.name, reference);
+    return true;
+}
+
+auto discover_registry_package_versions(PackageValidationRegistry& registry,
+    std::vector<PackageRequirement>& versions, std::size_t& package_count) -> bool {
+    const auto packages_root = registry.root / "packages";
+    std::error_code ec;
+    if (!fs::exists(packages_root, ec) || !fs::is_directory(packages_root, ec)) {
+        std::println("Error: registry does not contain a packages directory '{}'", packages_root.string());
+        return false;
+    }
+
+    std::unordered_set<std::string> package_names;
+    for (fs::recursive_directory_iterator it {
+             packages_root, fs::directory_options::skip_permission_denied, ec }, end;
+        !ec && it != end; it.increment(ec)) {
+        std::error_code entry_ec;
+        if (!it->is_regular_file(entry_ec) || it->path().filename() != "package.bspm") {
+            continue;
+        }
+
+        PackageMetadata metadata;
+        const auto metadata_path = fs::absolute(it->path()).lexically_normal();
+        if (!parse_package_metadata(metadata_path, metadata)
+            || !validate_package_metadata_placement(registry.root, metadata_path, metadata)) {
+            return false;
+        }
+        package_names.insert(metadata.name);
+        versions.push_back({
+            .name = metadata.name,
+            .version = metadata.version + "#" + std::to_string(metadata.package_revision),
+        });
+    }
+    if (ec) {
+        std::println("Error: couldn't inspect registry packages '{}': {}", packages_root.string(), ec.message());
+        return false;
+    }
+    if (versions.empty()) {
+        std::println("Error: registry '{}' does not contain any package versions", registry.root.string());
+        return false;
+    }
+
+    std::sort(versions.begin(), versions.end(), [](const auto& left, const auto& right) {
+        return std::tie(left.name, left.version) < std::tie(right.name, right.version);
+    });
+    const auto duplicate = std::adjacent_find(versions.begin(), versions.end(), [](const auto& left, const auto& right) {
+        return left.name == right.name && left.version == right.version;
+    });
+    if (duplicate != versions.end()) {
+        std::println("Error: registry contains duplicate package version '{} {}'", duplicate->name,
+            duplicate->version);
+        return false;
+    }
+    package_count = package_names.size();
+    return true;
+}
+
+auto validate_registry_baseline_references(PackageValidationRegistry& registry) -> bool {
+    for (const auto& [package, reference] : registry.baseline) {
+        auto* candidates = validation_candidates_for(registry, package);
+        if (!candidates) {
+            return false;
+        }
+        VersionConstraint constraint;
+        if (!parse_version_constraint(reference, constraint)) {
+            std::println("Error: registry baseline for '{}' has invalid reference '{}'", package, reference);
+            return false;
+        }
+        if (std::none_of(candidates->begin(), candidates->end(), [&](const auto& candidate) {
+                return version_constraint_matches(
+                    constraint, candidate.semantic_version, candidate.metadata.package_revision);
+            })) {
+            std::println("Error: registry baseline '{} {}' does not reference an available package version", package,
+                reference);
+            return false;
+        }
+    }
+    return true;
+}
+
+auto registry_validate_command(const fs::path& argument) -> bool {
+    PackageValidationRegistry registry;
+    if (!initialize_package_validation_registry(argument, registry)) {
+        return false;
+    }
+
+    std::vector<PackageRequirement> versions;
+    std::size_t package_count = 0;
+    if (!discover_registry_package_versions(registry, versions, package_count)
+        || !validate_registry_baseline_references(registry)) {
+        return false;
+    }
+
+    ValidationTemporaryRoot temporary;
+    if (!create_validation_temporary_root(temporary)) {
+        return false;
+    }
+    for (const auto& package : versions) {
+        if (!validate_package_solution(registry, package, temporary.path)) {
+            std::println("Error: validation failed for package '{} {}'", package.name, package.version);
+            return false;
+        }
+    }
+
+    std::println("validated registry '{}': {} packages, {} versions", registry.root.string(), package_count,
+        versions.size());
+    return true;
+}
+
+struct ValidationCommandConfiguration {
+    fs::path path { fs::current_path() };
+};
+
+auto parse_validation_command_configuration(std::string_view command, int argc, char* argv[],
+    ValidationCommandConfiguration& configuration) -> bool {
+    if (argc < 3 || std::string_view { argv[2] } != ValidateTag) {
+        std::println("Error: {} expects the '{}' subcommand", command, ValidateTag);
+        return false;
+    }
+    if (argc > 4) {
+        std::println("Error: {} {} accepts at most one path", command, ValidateTag);
+        return false;
+    }
+    if (argc == 4) {
+        const std::string_view path { argv[3] };
+        if (path.starts_with('-')) {
+            std::println("Error: invalid option '{}' for {} {}", path, command, ValidateTag);
+            return false;
+        }
+        configuration.path = argv[3];
     }
     return true;
 }
@@ -6489,7 +7338,20 @@ int main(int argc, char* argv[]) {
         return doctor_command(context) ? 0 : 1;
     }
 
-    if (command == InstallTag || command == UpdateTag || command == AddTag || command == RemoveTag) {
+    if (command == PackageTag || command == RegistryTag) {
+        ValidationCommandConfiguration configuration;
+        if (!parse_validation_command_configuration(command, argc, argv, configuration)) {
+            std::println("Type '{} help {}' for more description.", context.name, command);
+            return 1;
+        }
+        if (command == PackageTag) {
+            return package_validate_command(configuration.path) ? 0 : 1;
+        }
+        return registry_validate_command(configuration.path) ? 0 : 1;
+    }
+
+    if (command == InstallTag || command == UpdateTag || command == AddTag || command == RemoveTag
+        || command == SearchTag || command == InfoTag || command == OutdatedTag) {
         DependencyCommandConfiguration configuration;
         if (!parse_dependency_command_configuration(command, argc, argv, configuration)) {
             std::println("Type '{} help {}' for more description.", context.name, command);
@@ -6499,6 +7361,16 @@ int main(int argc, char* argv[]) {
         ProjectConfig dependency_project;
         if (!load_dependency_project(configuration.project_root, dependency_project)) {
             return 1;
+        }
+
+        if (command == SearchTag) {
+            return search_packages_command(dependency_project, configuration.package) ? 0 : 1;
+        }
+        if (command == InfoTag) {
+            return info_package_command(dependency_project, configuration.package) ? 0 : 1;
+        }
+        if (command == OutdatedTag) {
+            return outdated_packages_command(std::move(dependency_project)) ? 0 : 1;
         }
 
         if (command == InstallTag) {
