@@ -1,5 +1,7 @@
 # Examples
 
+[Project README](../README.md) · [Documentation index](../docs/README.md) · [Usage guide](../docs/usage.md)
+
 Each example is a small user-facing target that demonstrates one `bspm`
 capability. Automated smoke coverage lives separately under `tests/`.
 
